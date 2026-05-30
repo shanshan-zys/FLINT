@@ -131,7 +131,7 @@ def final_displacement_diversity(trajs: List[np.ndarray]) -> float:
 
 
 def spatial_coverage(trajs: List[np.ndarray], grid_size: int = 20,
-                     bounds=(0, 0, 480, 360)) -> float:
+                     bounds=(0, 0, 640, 480)) -> float:
     x_min, y_min, x_max, y_max = bounds
     visited = set()
     for t in trajs:
@@ -143,7 +143,7 @@ def spatial_coverage(trajs: List[np.ndarray], grid_size: int = 20,
 
 
 def endpoint_entropy(trajs: List[np.ndarray], num_bins: int = 10,
-                     bounds=(0, 0, 480, 360)) -> float:
+                     bounds=(0, 0, 640, 480)) -> float:
     x_min, y_min, x_max, y_max = bounds
     endpoints = []
     for t in trajs:

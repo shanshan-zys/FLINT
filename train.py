@@ -88,6 +88,7 @@ class PhysicsLoss:
         tc = config["training"]["physics_loss"]
         self.collision_weight = tc.get("collision_weight", 0.1)
         self.smoothness_weight = tc.get("smoothness_weight", 0.05)
+        self.walkable_weight = tc.get("walkable_weight", 0.05)
         self.collision_threshold = tc.get("collision_threshold", 10.0)
 
         bin_size = config["tokenizer"]["bin_size"]
@@ -107,6 +108,33 @@ class PhysicsLoss:
         all_ids = [llm_tokenizer.convert_tokens_to_ids(t) for t in coord_tokens]
         self.x_token_ids = [tid for t, tid in zip(coord_tokens, all_ids) if t.startswith("<x_") and not t.startswith("<x_0>")]
         self.y_token_ids = [tid for t, tid in zip(coord_tokens, all_ids) if t.startswith("<y_") and not t.startswith("<y_0>")]
+
+        self.walkable_map = None
+        if self.walkable_weight > 0:
+            scenario_dir = config["data"].get("scenario_dir", "./data/scenarios")
+            grid_size = config["data"].get("map_grid_size", 10)
+            self._load_walkable_maps(scenario_dir, grid_size, x_bins, y_bins, bin_size)
+
+    def _load_walkable_maps(self, scenario_dir, grid_size, x_bins, y_bins, bin_size):
+        merged = np.ones((480, 640), dtype=np.float32)
+        loaded_any = False
+        for scene in ["eth", "hotel", "univ", "zara1", "zara2"]:
+            map_path = os.path.join(scenario_dir, f"{scene}.npy")
+            if os.path.exists(map_path):
+                loaded_any = True
+        if not loaded_any:
+            self.walkable_weight = 0
+            return
+        walkable_grid = np.ones((y_bins, x_bins), dtype=np.float32)
+        for scene in ["eth", "hotel", "univ", "zara1", "zara2"]:
+            map_path = os.path.join(scenario_dir, f"{scene}.npy")
+            if os.path.exists(map_path):
+                scene_map = np.load(map_path).astype(np.float32)
+                scene_grid = scene_map[bin_size//2::bin_size, bin_size//2::bin_size]
+                h = min(scene_grid.shape[0], y_bins)
+                w = min(scene_grid.shape[1], x_bins)
+                walkable_grid[:h, :w] = np.minimum(walkable_grid[:h, :w], scene_grid[:h, :w])
+        self.walkable_map = torch.tensor(walkable_grid, dtype=torch.float32, device=self.device)
 
     def compute(self, logits: torch.Tensor) -> torch.Tensor:
         loss = torch.tensor(0.0, device=self.device)
@@ -135,9 +163,15 @@ class PhysicsLoss:
             diffs_y = y_coords[:, :, None] - y_coords[:, None, :]
             dists = torch.sqrt(diffs_x ** 2 + diffs_y ** 2 + 1e-6)
             mask = torch.triu(torch.ones_like(dists[0]), diagonal=1).bool()
-            pairwise = dists[:, mask.unsqueeze(0).expand_as(dists).bool() if False else mask]
             penalty = torch.relu(self.collision_threshold - dists[:, mask])
             loss = loss + self.collision_weight * penalty.mean()
+
+        if self.walkable_weight > 0 and self.walkable_map is not None:
+            x_bin_probs = x_probs
+            y_bin_probs = y_probs
+            walkable_prob = torch.einsum('bti,btj,ij->bt', y_bin_probs, x_bin_probs, self.walkable_map)
+            unwalkable_penalty = torch.relu(0.5 - walkable_prob)
+            loss = loss + self.walkable_weight * unwalkable_penalty.mean()
 
         return loss
 

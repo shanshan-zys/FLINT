@@ -1,5 +1,5 @@
 """
-数据准备：加载原始数据 + coordinate tokenizer + SFT 数据集构建
+数据准备：加载 clip 数据 + coordinate tokenizer + SFT 数据集构建
 
 支持两种输出模式：
   1. coord tokens: <x_i><y_j> 特殊 token（主模型）
@@ -7,26 +7,24 @@
 """
 
 import os
+import re
 import json
 import yaml
 import argparse
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 ABSENT = -1.0
 
 
-# ====================================================================
-# Coordinate Tokenizer (absolute mode only)
-# ====================================================================
 class CoordTokenizer:
 
-    def __init__(self, resolution=(360, 480), bin_size=5):
+    def __init__(self, resolution=(480, 640), bin_size=5):
         self.H, self.W = resolution
         self.bin_size = bin_size
-        self.x_bins = self.W // bin_size  # 96
-        self.y_bins = self.H // bin_size  # 72
+        self.x_bins = self.W // bin_size
+        self.y_bins = self.H // bin_size
 
         self.x_tokens = [f"<x_{i}>" for i in range(self.x_bins + 1)]
         self.y_tokens = [f"<y_{j}>" for j in range(self.y_bins + 1)]
@@ -74,9 +72,6 @@ class CoordTokenizer:
         return traj
 
 
-# ====================================================================
-# Raw number encoder (消融: 逗号分隔xy, 分号分隔位置)
-# ====================================================================
 def encode_raw_numbers(trajectories: np.ndarray) -> str:
     N, T, _ = trajectories.shape
     parts = []
@@ -112,135 +107,91 @@ def decode_raw_numbers(text: str, num_agents: int, num_steps: int) -> np.ndarray
     return traj
 
 
-# ====================================================================
-# Data loading
-# ====================================================================
-def load_eth_ucy(data_dir: str, subset: str, clip_length: int = 25) -> List[Dict]:
-    txt_files = sorted(Path(data_dir).glob(f"{subset}*.txt"))
-    if not txt_files:
-        txt_files = sorted(Path(data_dir).glob(f"**/{subset}*.txt"))
-    if not txt_files:
-        print(f"  Warning: no data for {subset} in {data_dir}")
-        return []
+def _extract_subset(clip_id):
+    m = re.match(r'(eth|hotel|univ|zara1|zara2)', clip_id)
+    return m.group(1) if m else None
 
-    all_data = []
-    for f in txt_files:
-        data = np.loadtxt(f)
-        if data.ndim == 1:
-            data = data.reshape(1, -1)
-        all_data.append(data)
 
-    data = np.concatenate(all_data, axis=0)
+def load_clip_file(txt_path, clip_length=25):
+    clip_id = Path(txt_path).stem
+    subset = _extract_subset(clip_id)
+    data = np.loadtxt(txt_path)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+
     frames = data[:, 0].astype(int)
     ped_ids = data[:, 1].astype(int)
     positions = data[:, 2:4]
 
-    unique_frames = sorted(set(frames))
-    clips = []
+    population = int(ped_ids.max())
+    num_frames = int(frames.max())
 
-    for start_idx in range(0, len(unique_frames), clip_length):
-        clip_frames = unique_frames[start_idx:start_idx + clip_length]
-        if len(clip_frames) < 2:
-            continue
+    trajectories = {}
+    initial_states = {}
+    for pid in range(1, population + 1):
+        pid_mask = ped_ids == pid
+        pid_frames = frames[pid_mask]
+        pid_pos = positions[pid_mask]
+        traj = []
+        for f in range(1, num_frames + 1):
+            idx = np.where(pid_frames == f)[0]
+            traj.append(pid_pos[idx[0]].tolist() if len(idx) > 0 else [-1.0, -1.0])
+        trajectories[int(pid)] = traj
 
-        mask = np.isin(frames, clip_frames)
-        clip_fids = frames[mask]
-        clip_peds = ped_ids[mask]
-        clip_pos = positions[mask]
-        unique_peds = sorted(set(clip_peds))
+        if traj[0][0] >= 0:
+            vx = traj[1][0] - traj[0][0] if len(traj) > 1 and traj[1][0] >= 0 else 0.0
+            vy = traj[1][1] - traj[0][1] if len(traj) > 1 and traj[1][0] >= 0 else 0.0
+            initial_states[int(pid)] = {"position": traj[0], "velocity": [vx, vy]}
 
-        trajectories = {}
-        initial_states = {}
-        for pid in unique_peds:
-            pid_mask = clip_peds == pid
-            pid_frames = clip_fids[pid_mask]
-            pid_pos = clip_pos[pid_mask]
-            traj = []
-            for cf in clip_frames:
-                idx = np.where(pid_frames == cf)[0]
-                traj.append(pid_pos[idx[0]].tolist() if len(idx) > 0 else [-1.0, -1.0])
-            trajectories[int(pid)] = traj
-
-            if traj[0][0] >= 0:
-                vx = traj[1][0] - traj[0][0] if len(traj) > 1 and traj[1][0] >= 0 else 0.0
-                vy = traj[1][1] - traj[0][1] if len(traj) > 1 and traj[1][0] >= 0 else 0.0
-                initial_states[int(pid)] = {"position": traj[0], "velocity": [vx, vy]}
-
-        clips.append({
-            "clip_id": f"{subset}_clip{start_idx // clip_length:04d}",
-            "subset": subset,
-            "num_frames": len(clip_frames),
-            "num_pedestrians": len(unique_peds),
-            "trajectories": trajectories,
-            "initial_states": initial_states,
-        })
-
-    print(f"  {subset}: {len(clips)} clips, "
-          f"{sum(c['num_pedestrians'] for c in clips)} trajectories")
-    return clips
+    return {
+        "clip_id": clip_id,
+        "subset": subset,
+        "num_frames": num_frames,
+        "num_pedestrians": population,
+        "trajectories": trajectories,
+        "initial_states": initial_states,
+    }
 
 
 def load_all_trajectories(data_dir: str, clip_length: int = 25) -> List[Dict]:
-    subsets = ["eth", "hotel", "univ", "zara1", "zara2"]
+    txt_files = sorted(Path(data_dir).glob("*.txt"))
     all_clips = []
-    for subset in subsets:
-        all_clips.extend(load_eth_ucy(data_dir, subset, clip_length))
+    counts = {}
+    for f in txt_files:
+        clip = load_clip_file(str(f), clip_length)
+        all_clips.append(clip)
+        subset = clip["subset"]
+        counts[subset] = counts.get(subset, 0) + 1
+    for subset, count in sorted(counts.items()):
+        print(f"  {subset}: {count} clips")
     print(f"Total: {len(all_clips)} clips")
     return all_clips
 
 
-def normalize_coordinates(trajectories: Dict, resolution=(360, 480)) -> Dict:
-    H, W = resolution
-    all_coords = []
-    for traj in trajectories.values():
-        for x, y in traj:
-            if x >= 0 and y >= 0:
-                all_coords.append([x, y])
-    if not all_coords:
-        return trajectories
+SFT_INSTRUCTION_COORD = """You are a crowd simulation engine. Given scene context, walkable area, and initial conditions, generate realistic pedestrian trajectories as coordinate tokens.
 
-    coords = np.array(all_coords)
-    x_min, y_min = coords.min(axis=0)
-    x_max, y_max = coords.max(axis=0)
-    x_range = max(x_max - x_min, 1.0)
-    y_range = max(y_max - y_min, 1.0)
-
-    normalized = {}
-    for pid, traj in trajectories.items():
-        new_traj = []
-        for x, y in traj:
-            if x < 0 or y < 0:
-                new_traj.append([-1.0, -1.0])
-            else:
-                new_traj.append([
-                    float((x - x_min) / x_range * (W - 1)),
-                    float((y - y_min) / y_range * (H - 1)),
-                ])
-        normalized[pid] = new_traj
-    return normalized
-
-
-# ====================================================================
-# SFT dataset builder
-# ====================================================================
-SFT_INSTRUCTION_COORD = """You are a crowd simulation engine. Given scene context and initial conditions, generate realistic pedestrian trajectories as coordinate tokens.
+{walkable_area}
 
 Output rules:
 1. Output a SINGLE unbroken string of coordinate tokens, no spaces between tokens
 2. Use <x_i><y_j> for each pedestrian's position at each timestep
 3. Use <x_0><y_0> when a pedestrian has not appeared or has left the scene
 4. Order: for each timestep t=1..T, output all N pedestrians' positions sequentially
-5. Coordinate system: x increases rightward (1 to {x_bins}), y increases downward (1 to {y_bins})
-6. Do NOT add any explanation, only output the token string"""
+5. Coordinate system: 640x480 image, x increases rightward (1 to {x_bins}), y increases downward (1 to {y_bins})
+6. Pedestrians must stay within the walkable area
+7. Do NOT add any explanation, only output the token string"""
 
-SFT_INSTRUCTION_RAW = """You are a crowd simulation engine. Given scene context and initial conditions, generate realistic pedestrian trajectories as numeric coordinates.
+SFT_INSTRUCTION_RAW = """You are a crowd simulation engine. Given scene context, walkable area, and initial conditions, generate realistic pedestrian trajectories as numeric coordinates.
+
+{walkable_area}
 
 Output rules:
 1. Output coordinates as comma-separated x,y pairs, with positions separated by semicolons
 2. Use 0,0 when a pedestrian has not appeared or has left the scene
 3. Order: for each timestep t=1..T, output all N pedestrians' positions sequentially
-4. Coordinate system: pixel coordinates in a 480x360 image (x: 0-479, y: 0-359)
-5. Do NOT add any explanation, only output the coordinate string
+4. Coordinate system: pixel coordinates in a 640x480 image (x: 0-639, y: 0-479)
+5. Pedestrians must stay within the walkable area
+6. Do NOT add any explanation, only output the coordinate string
 Example: 45,30;12,55;0,0;78,120"""
 
 SFT_INPUT_TEMPLATE = """Scenario: {scenario_description}
@@ -267,9 +218,25 @@ def _format_initial_states(initial_states: Dict, ped_ids: List) -> str:
     return "\n".join(lines)
 
 
+def _load_walkable_grid(scenario_dir, subset, grid_size=10):
+    map_path = os.path.join(scenario_dir, f"{subset}.npy")
+    if not os.path.exists(map_path):
+        return ""
+    map_full = np.load(map_path)
+    map_grid = map_full[::grid_size, ::grid_size]
+    h, w = map_grid.shape
+    grid_str = "\n".join("".join(str(int(x)) for x in row) for row in map_grid)
+    return (f"The walkable area is represented as a {h}x{w} grid "
+            f"(each cell = {grid_size}x{grid_size} pixels in the 480x640 image).\n"
+            f"1 = walkable, 0 = obstacle:\n{grid_str}")
+
+
 def build_sft_dataset(annotations_path: str, config: dict, output_path: str, use_coord_tokens: bool = True):
     with open(annotations_path) as f:
         annotations = json.load(f)
+
+    scenario_dir = config["data"].get("scenario_dir", "./data/scenarios")
+    grid_size = config["data"].get("map_grid_size", 10)
 
     tokenizer = None
     if use_coord_tokens:
@@ -277,15 +244,24 @@ def build_sft_dataset(annotations_path: str, config: dict, output_path: str, use
             resolution=tuple(config["data"]["resolution"]),
             bin_size=config["tokenizer"]["bin_size"],
         )
-        instruction = SFT_INSTRUCTION_COORD.format(
-            x_bins=config["tokenizer"]["x_bins"],
-            y_bins=config["tokenizer"]["y_bins"],
-        )
-    else:
-        instruction = SFT_INSTRUCTION_RAW
 
+    walkable_cache = {}
     sft_data = []
     for ann in annotations:
+        subset = ann.get("subset", "")
+        if subset not in walkable_cache:
+            walkable_cache[subset] = _load_walkable_grid(scenario_dir, subset, grid_size)
+        walkable_area = walkable_cache[subset]
+
+        if use_coord_tokens:
+            instruction = SFT_INSTRUCTION_COORD.format(
+                walkable_area=walkable_area,
+                x_bins=config["tokenizer"]["x_bins"],
+                y_bins=config["tokenizer"]["y_bins"],
+            )
+        else:
+            instruction = SFT_INSTRUCTION_RAW.format(walkable_area=walkable_area)
+
         trajectories = ann["trajectories"]
         ped_ids = sorted(trajectories.keys(), key=lambda x: int(x))
         num_peds = len(ped_ids)
@@ -320,7 +296,7 @@ def build_sft_dataset(annotations_path: str, config: dict, output_path: str, use
             "output": response,
             "metadata": {
                 "clip_id": ann["clip_id"],
-                "subset": ann["subset"],
+                "subset": subset,
                 "num_pedestrians": num_peds,
                 "num_timesteps": num_steps,
                 "use_coord_tokens": use_coord_tokens,
@@ -365,20 +341,18 @@ def split_train_test(sft_path: str, train_ratio: float = 0.8, seed: int = 42):
     return train_path, test_path
 
 
-# ====================================================================
-# Tokenizer roundtrip test
-# ====================================================================
 def test_tokenizer(config):
     print("=== Tokenizer Roundtrip Test ===")
     tok = CoordTokenizer(
         resolution=tuple(config["data"]["resolution"]),
         bin_size=config["tokenizer"]["bin_size"],
     )
+    print(f"Resolution: {tok.W}x{tok.H}, bin_size: {tok.bin_size}")
     print(f"Vocab size: {len(tok.vocab)} ({tok.x_bins + 1} x-tokens + {tok.y_bins + 1} y-tokens)")
 
     np.random.seed(42)
     N, T = 5, 25
-    traj = np.random.rand(N, T, 2) * np.array([480, 360])
+    traj = np.random.rand(N, T, 2) * np.array([tok.W, tok.H])
     traj[0, 10:15] = ABSENT
     traj[2, 0:3] = ABSENT
 

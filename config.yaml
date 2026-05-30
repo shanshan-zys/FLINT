@@ -1,17 +1,19 @@
 # FLINT Configuration
 
 data:
-  raw_dir: "./data/raw/eth_ucy"
-  resolution: [360, 480]        # [H, W]
+  raw_dir: "./data/trajectories"
+  scenario_dir: "./data/scenarios"
+  resolution: [480, 640]        # [H, W]
   fps: 2.5
   clip_length: 25
   train_ratio: 0.8
+  map_grid_size: 10             # walkable area grid 下采样步长
   datasets: [eth, hotel, univ, zara1, zara2]
 
 tokenizer:
   bin_size: 5
-  x_bins: 96                    # 480 / 5
-  y_bins: 72                    # 360 / 5
+  x_bins: 128                   # 640 / 5
+  y_bins: 96                    # 480 / 5
 
 training:
   backbone: "Qwen/Qwen3-8B-Instruct"
@@ -26,6 +28,7 @@ training:
   physics_loss:
     collision_weight: 0.1
     smoothness_weight: 0.05
+    walkable_weight: 0.05
     collision_threshold: 10.0
   output_dir: "./outputs"
 
