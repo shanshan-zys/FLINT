@@ -9,7 +9,6 @@
 import os
 import re
 import json
-import yaml
 import argparse
 import numpy as np
 from pathlib import Path
@@ -154,14 +153,20 @@ def load_clip_file(txt_path, clip_length=25):
 
 
 def load_all_trajectories(data_dir: str, clip_length: int = 25) -> List[Dict]:
-    txt_files = sorted(Path(data_dir).glob("*.txt"))
+    base = Path(data_dir)
     all_clips = []
     counts = {}
-    for f in txt_files:
-        clip = load_clip_file(str(f), clip_length)
-        all_clips.append(clip)
-        subset = clip["subset"]
-        counts[subset] = counts.get(subset, 0) + 1
+    for scene_dir in sorted(base.iterdir()):
+        if not scene_dir.is_dir():
+            continue
+        traj_dir = scene_dir / 'trajectories'
+        if not traj_dir.exists():
+            continue
+        for f in sorted(traj_dir.glob("*.txt")):
+            clip = load_clip_file(str(f), clip_length)
+            all_clips.append(clip)
+            subset = clip["subset"]
+            counts[subset] = counts.get(subset, 0) + 1
     for subset, count in sorted(counts.items()):
         print(f"  {subset}: {count} clips")
     print(f"Total: {len(all_clips)} clips")
@@ -218,8 +223,8 @@ def _format_initial_states(initial_states: Dict, ped_ids: List) -> str:
     return "\n".join(lines)
 
 
-def _load_walkable_grid(scenario_dir, subset, grid_size=10):
-    map_path = os.path.join(scenario_dir, f"{subset}.npy")
+def _load_walkable_grid(processed_dir, subset, grid_size=10):
+    map_path = os.path.join(processed_dir, subset, f"{subset}.npy")
     if not os.path.exists(map_path):
         return ""
     map_full = np.load(map_path)
@@ -235,7 +240,7 @@ def build_sft_dataset(annotations_path: str, config: dict, output_path: str, use
     with open(annotations_path) as f:
         annotations = json.load(f)
 
-    scenario_dir = config["data"].get("scenario_dir", "./data/scenarios")
+    processed_dir = config["data"].get("processed_dir", "./data/processed")
     grid_size = config["data"].get("map_grid_size", 10)
 
     tokenizer = None
@@ -250,7 +255,7 @@ def build_sft_dataset(annotations_path: str, config: dict, output_path: str, use
     for ann in annotations:
         subset = ann.get("subset", "")
         if subset not in walkable_cache:
-            walkable_cache[subset] = _load_walkable_grid(scenario_dir, subset, grid_size)
+            walkable_cache[subset] = _load_walkable_grid(processed_dir, subset, grid_size)
         walkable_area = walkable_cache[subset]
 
         if use_coord_tokens:
@@ -388,23 +393,43 @@ def test_tokenizer(config):
     print("=== Test PASSED ===")
 
 
+def _build_config(args):
+    return {
+        "data": {
+            "resolution": [args.resolution_h, args.resolution_w],
+            "processed_dir": args.processed_dir,
+            "map_grid_size": args.map_grid_size,
+            "train_ratio": args.train_ratio,
+        },
+        "tokenizer": {
+            "bin_size": args.bin_size,
+            "x_bins": args.resolution_w // args.bin_size,
+            "y_bins": args.resolution_h // args.bin_size,
+        },
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--annotations", type=str, help="Annotations JSON path")
     parser.add_argument("--output", type=str, default="data/sft.json")
     parser.add_argument("--no_coord_tokens", action="store_true")
     parser.add_argument("--split", action="store_true", help="Split into train/test")
     parser.add_argument("--test_tokenizer", action="store_true")
+    parser.add_argument("--bin_size", type=int, default=5)
+    parser.add_argument("--resolution_h", type=int, default=480)
+    parser.add_argument("--resolution_w", type=int, default=640)
+    parser.add_argument("--processed_dir", type=str, default="data/processed")
+    parser.add_argument("--map_grid_size", type=int, default=10)
+    parser.add_argument("--train_ratio", type=float, default=0.8)
     args = parser.parse_args()
 
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
+    config = _build_config(args)
 
     if args.test_tokenizer:
         test_tokenizer(config)
     elif args.split:
-        split_train_test(args.annotations or args.output, config["data"]["train_ratio"])
+        split_train_test(args.annotations or args.output, args.train_ratio)
     elif args.annotations:
         build_sft_dataset(args.annotations, config, args.output, not args.no_coord_tokens)
     else:

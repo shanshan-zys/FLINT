@@ -2,14 +2,13 @@
 FLINT 评估：质量指标 + 多样性指标 + LLM Judge
 
 用法：
-  python evaluate.py --results_dir results/main --test_data data/test.json --config config.yaml
+  python evaluate.py --results_dir results/main --test_data data/test.json
   python evaluate.py --compare eval/main eval/ablation_raw_numbers ...
 """
 
 import os
 import re
 import json
-import yaml
 import argparse
 import numpy as np
 from pathlib import Path
@@ -502,18 +501,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--results_dir", type=str)
     parser.add_argument("--test_data", type=str)
-    parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--output_dir", type=str, default="eval/main")
     parser.add_argument("--no_llm_judge", action="store_true")
     parser.add_argument("--compare", nargs="+", type=str,
                         help="Compare multiple eval result dirs")
+    parser.add_argument("--bin_size", type=int, default=5)
+    parser.add_argument("--resolution_h", type=int, default=480)
+    parser.add_argument("--resolution_w", type=int, default=640)
+    parser.add_argument("--llm_judges", nargs="*", type=str,
+                        default=["deepseek-chat"])
     args = parser.parse_args()
 
     if args.compare:
         compare_models(args.compare, args.output_dir)
     elif args.results_dir and args.test_data:
-        with open(args.config) as f:
-            config = yaml.safe_load(f)
+        config = {
+            "data": {"resolution": [args.resolution_h, args.resolution_w]},
+            "tokenizer": {"bin_size": args.bin_size},
+            "evaluation": {"llm_judges": args.llm_judges},
+        }
         evaluate_model(args.results_dir, args.test_data, config, args.output_dir,
                        run_llm_judge=not args.no_llm_judge)
     else:

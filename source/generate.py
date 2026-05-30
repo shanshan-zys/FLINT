@@ -5,7 +5,6 @@ FLINT 推理生成：加载训练好的模型，生成轨迹
 import os
 import re
 import json
-import yaml
 import torch
 import argparse
 import numpy as np
@@ -14,9 +13,23 @@ from pathlib import Path
 from prepare_data import CoordTokenizer, decode_raw_numbers
 
 
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+def _build_config(args):
+    return {
+        "data": {
+            "resolution": [args.resolution_h, args.resolution_w],
+        },
+        "tokenizer": {
+            "bin_size": args.bin_size,
+            "x_bins": args.resolution_w // args.bin_size,
+            "y_bins": args.resolution_h // args.bin_size,
+        },
+        "training": {
+            "max_seq_length": args.max_seq_length,
+        },
+        "evaluation": {
+            "top_p": args.top_p,
+        },
+    }
 
 
 def format_alpaca_prompt(sample: dict) -> str:
@@ -67,7 +80,7 @@ def generate_samples(model, llm_tokenizer, prompt: str, num_samples: int,
 
 
 def generate_from_test(args):
-    config = load_config(args.config)
+    config = _build_config(args)
     model, llm_tokenizer = load_model(args.model_path, config)
 
     with open(args.test_data) as f:
@@ -126,7 +139,7 @@ def generate_from_test(args):
 
 
 def generate_custom(args):
-    config = load_config(args.config)
+    config = _build_config(args)
     model, llm_tokenizer = load_model(args.model_path, config)
 
     from prepare_data import SFT_INSTRUCTION_COORD
@@ -187,14 +200,18 @@ def generate_custom(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--test_data", type=str, default=None)
     parser.add_argument("--custom_prompt", type=str, default=None)
     parser.add_argument("--num_agents", type=int, default=10)
     parser.add_argument("--num_steps", type=int, default=25)
     parser.add_argument("--num_samples", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--output_dir", type=str, default="results/main")
+    parser.add_argument("--max_seq_length", type=int, default=8192)
+    parser.add_argument("--bin_size", type=int, default=5)
+    parser.add_argument("--resolution_h", type=int, default=480)
+    parser.add_argument("--resolution_w", type=int, default=640)
     args = parser.parse_args()
 
     if args.custom_prompt:

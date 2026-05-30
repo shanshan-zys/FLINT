@@ -101,11 +101,18 @@ def load_clip(txt_path):
 
 def load_all_clips(data_dir, subset_filter=None):
     clips = []
-    for f in sorted(Path(data_dir).glob("*.txt")):
-        clip = load_clip(str(f))
-        if subset_filter and clip["subset"] != subset_filter:
+    base = Path(data_dir)
+    for scene_dir in sorted(base.iterdir()):
+        if not scene_dir.is_dir():
             continue
-        clips.append(clip)
+        traj_dir = scene_dir / 'trajectories'
+        if not traj_dir.exists():
+            continue
+        for f in sorted(traj_dir.glob("*.txt")):
+            clip = load_clip(str(f))
+            if subset_filter and clip["subset"] != subset_filter:
+                continue
+            clips.append(clip)
     return clips
 
 
@@ -189,8 +196,7 @@ def prepare_clip_prompts(data_dir, output_dir, scene_desc_path=None, clip_length
 
 
 def annotate_with_api(data_dir, output_path, scene_desc_path=None,
-                      api_key=None, model="gemini-2.5-flash", clip_length=25,
-                      video_dir=None):
+                      api_key=None, model="gemini-2.5-flash", clip_length=25):
     import google.generativeai as genai
     genai.configure(api_key=api_key or os.environ.get("GOOGLE_API_KEY"))
     client = genai.GenerativeModel(model)
@@ -223,11 +229,11 @@ def annotate_with_api(data_dir, output_path, scene_desc_path=None,
 
             try:
                 contents = [prompt_text]
-                if video_dir:
-                    video_path = Path(video_dir) / f"{clip['clip_id']}.mp4"
-                    if video_path.exists():
-                        video_file = genai.upload_file(str(video_path))
-                        contents = [video_file, prompt_text]
+                video_path = (Path(data_dir) / clip['subset'] / 'videos'
+                             / f"{clip['clip_id']}.mp4")
+                if video_path.exists():
+                    video_file = genai.upload_file(str(video_path))
+                    contents = [video_file, prompt_text]
 
                 resp = client.generate_content(
                     contents,
@@ -279,9 +285,7 @@ if __name__ == "__main__":
                         help="Annotate crowd dynamics via Gemini API")
     parser.add_argument("--merge_scenes", action="store_true",
                         help="Merge scene descriptions into clip annotations")
-    parser.add_argument("--data_dir", type=str, default="data/trajectories")
-    parser.add_argument("--video_dir", type=str, default="data/clips",
-                        help="Video clip directory (for multimodal API annotation)")
+    parser.add_argument("--data_dir", type=str, default="data/processed")
     parser.add_argument("--output", type=str, default="prompts/")
     parser.add_argument("--scene_descriptions", type=str, default="scene_descriptions.json",
                         help="JSON file with {subset: description} for 5 scenes")
@@ -298,7 +302,7 @@ if __name__ == "__main__":
         prepare_clip_prompts(args.data_dir, args.output, args.scene_descriptions, args.clip_length)
     elif args.api_annotate:
         annotate_with_api(args.data_dir, args.output, args.scene_descriptions,
-                          args.api_key, args.model, args.clip_length, args.video_dir)
+                          args.api_key, args.model, args.clip_length)
     elif args.merge_scenes:
         assert args.annotations, "--annotations required for --merge_scenes"
         merge_scenes(args.annotations, args.scene_descriptions)

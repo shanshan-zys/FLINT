@@ -6,7 +6,6 @@
 
 import os
 import json
-import yaml
 import argparse
 import numpy as np
 from typing import List, Dict
@@ -171,12 +170,19 @@ def train_and_eval(train_samples, val_samples, config, device="cuda"):
 # Main experiment
 # ====================================================================
 def run_downstream(args):
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
+    config = {
+        "downstream": {
+            "obs_len": args.obs_len,
+            "pred_len": args.pred_len,
+            "predictor_epochs": args.predictor_epochs,
+            "predictor_lr": args.predictor_lr,
+            "predictor_batch_size": args.predictor_batch_size,
+        },
+    }
 
     device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-    obs_len = config["downstream"]["obs_len"]
-    pred_len = config["downstream"]["pred_len"]
+    obs_len = args.obs_len
+    pred_len = args.pred_len
 
     print("Loading original ETH-UCY data...")
     original_clips = load_all_trajectories(args.original_data)
@@ -233,7 +239,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--flint_results", type=str, required=True)
     parser.add_argument("--original_data", type=str, required=True)
-    parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--output_dir", type=str, default="eval/downstream")
+    parser.add_argument("--obs_len", type=int, default=8)
+    parser.add_argument("--pred_len", type=int, default=12)
+    parser.add_argument("--predictor_epochs", type=int, default=50)
+    parser.add_argument("--predictor_lr", type=float, default=1e-3)
+    parser.add_argument("--predictor_batch_size", type=int, default=64)
     args = parser.parse_args()
     run_downstream(args)

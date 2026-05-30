@@ -8,7 +8,6 @@ FLINT 训练：Unsloth + LoRA SFT
 
 import os
 import json
-import yaml
 import torch
 import argparse
 import numpy as np
@@ -21,9 +20,37 @@ from transformers import EarlyStoppingCallback
 from prepare_data import CoordTokenizer
 
 
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+def _build_config(args):
+    return {
+        "data": {
+            "resolution": [args.resolution_h, args.resolution_w],
+            "processed_dir": args.processed_dir,
+            "map_grid_size": args.map_grid_size,
+        },
+        "tokenizer": {
+            "bin_size": args.bin_size,
+            "x_bins": args.resolution_w // args.bin_size,
+            "y_bins": args.resolution_h // args.bin_size,
+        },
+        "training": {
+            "backbone": args.backbone,
+            "max_seq_length": args.max_seq_length,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "learning_rate": args.learning_rate,
+            "lr_scheduler": args.lr_scheduler,
+            "warmup_ratio": args.warmup_ratio,
+            "early_stopping_patience": args.early_stopping_patience,
+            "output_dir": args.output_dir or "./outputs",
+            "physics_loss": {
+                "collision_weight": args.collision_weight,
+                "smoothness_weight": args.smoothness_weight,
+                "walkable_weight": args.walkable_weight,
+                "collision_threshold": args.collision_threshold,
+            },
+        },
+    }
 
 
 def prepare_model_and_tokenizer(config: dict, use_coord_tokens: bool = True):
@@ -111,15 +138,15 @@ class PhysicsLoss:
 
         self.walkable_map = None
         if self.walkable_weight > 0:
-            scenario_dir = config["data"].get("scenario_dir", "./data/scenarios")
+            processed_dir = config["data"].get("processed_dir", "./data/processed")
             grid_size = config["data"].get("map_grid_size", 10)
-            self._load_walkable_maps(scenario_dir, grid_size, x_bins, y_bins, bin_size)
+            self._load_walkable_maps(processed_dir, grid_size, x_bins, y_bins, bin_size)
 
-    def _load_walkable_maps(self, scenario_dir, grid_size, x_bins, y_bins, bin_size):
+    def _load_walkable_maps(self, processed_dir, grid_size, x_bins, y_bins, bin_size):
         merged = np.ones((480, 640), dtype=np.float32)
         loaded_any = False
         for scene in ["eth", "hotel", "univ", "zara1", "zara2"]:
-            map_path = os.path.join(scenario_dir, f"{scene}.npy")
+            map_path = os.path.join(processed_dir, scene, f"{scene}.npy")
             if os.path.exists(map_path):
                 loaded_any = True
         if not loaded_any:
@@ -127,7 +154,7 @@ class PhysicsLoss:
             return
         walkable_grid = np.ones((y_bins, x_bins), dtype=np.float32)
         for scene in ["eth", "hotel", "univ", "zara1", "zara2"]:
-            map_path = os.path.join(scenario_dir, f"{scene}.npy")
+            map_path = os.path.join(processed_dir, scene, f"{scene}.npy")
             if os.path.exists(map_path):
                 scene_map = np.load(map_path).astype(np.float32)
                 scene_grid = scene_map[bin_size//2::bin_size, bin_size//2::bin_size]
@@ -195,7 +222,7 @@ def wrap_with_physics(trainer, config, coord_tok, llm_tokenizer):
 # Main training
 # ====================================================================
 def train(args):
-    config = load_config(args.config)
+    config = _build_config(args)
     tc = config["training"]
     use_coord = not args.no_coord_tokens
 
@@ -262,7 +289,6 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--train_data", type=str, required=True)
     parser.add_argument("--test_data", type=str, default=None)
     parser.add_argument("--use_coord_tokens", action="store_true", default=True)
@@ -270,5 +296,23 @@ if __name__ == "__main__":
     parser.add_argument("--physics", type=str, default="none",
                         choices=["none", "collision", "all"])
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--backbone", type=str, default="Qwen/Qwen3-8B-Instruct")
+    parser.add_argument("--max_seq_length", type=int, default=8192)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--lr_scheduler", type=str, default="cosine")
+    parser.add_argument("--warmup_ratio", type=float, default=0.05)
+    parser.add_argument("--early_stopping_patience", type=int, default=3)
+    parser.add_argument("--bin_size", type=int, default=5)
+    parser.add_argument("--resolution_h", type=int, default=480)
+    parser.add_argument("--resolution_w", type=int, default=640)
+    parser.add_argument("--processed_dir", type=str, default="data/processed")
+    parser.add_argument("--map_grid_size", type=int, default=10)
+    parser.add_argument("--collision_weight", type=float, default=0.1)
+    parser.add_argument("--smoothness_weight", type=float, default=0.05)
+    parser.add_argument("--walkable_weight", type=float, default=0.05)
+    parser.add_argument("--collision_threshold", type=float, default=10.0)
     args = parser.parse_args()
     train(args)

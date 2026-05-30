@@ -1,33 +1,34 @@
 #!/bin/bash
-# 评估：所有模型 + 模型对比
+# Evaluate all models + comparison
 set -e
 cd "$(dirname "$0")/.."
 
-python evaluate.py \
+COMMON="--bin_size 5 --resolution_h 480 --resolution_w 640 --llm_judges deepseek-chat"
+
+python source/evaluate.py \
     --results_dir results/main \
     --test_data data/test.json \
-    --config config.yaml \
-    --output_dir eval/main
+    --output_dir eval/main \
+    $COMMON
 
-python evaluate.py \
+python source/evaluate.py \
     --results_dir results/ablation_raw_numbers \
     --test_data data/test.json \
-    --config config.yaml \
-    --output_dir eval/ablation_raw_numbers
+    --output_dir eval/ablation_raw_numbers \
+    $COMMON
 
-python evaluate.py \
+python source/evaluate.py \
     --results_dir results/ablation_no_physics \
     --test_data data/test.json \
-    --config config.yaml \
-    --output_dir eval/ablation_no_physics
+    --output_dir eval/ablation_no_physics \
+    $COMMON
 
-python evaluate.py \
+python source/evaluate.py \
     --results_dir results/ablation_collision_only \
     --test_data data/test.json \
-    --config config.yaml \
-    --output_dir eval/ablation_collision_only
+    --output_dir eval/ablation_collision_only \
+    $COMMON
 
-# 模型对比
-python evaluate.py \
+python source/evaluate.py \
     --compare eval/main eval/ablation_raw_numbers eval/ablation_no_physics eval/ablation_collision_only \
     --output_dir eval/comparison
