@@ -38,14 +38,27 @@ def load_obsmat(path):
     return frame_ids, ped_ids, pos_x, pos_y
 
 
-def world_to_pixel(H_path, pos_x, pos_y):
+def world_to_pixel(H_path, pos_x, pos_y, scene_name, native_w, native_h):
     H = np.loadtxt(H_path)
     H_inv = np.linalg.inv(H)
     n = len(pos_x)
-    world = np.vstack([pos_x, pos_y, np.ones(n)])
+
+    if scene_name == 'univ':
+        world = np.vstack([pos_y, pos_x, np.ones(n)])
+    else:
+        world = np.vstack([pos_x, pos_y, np.ones(n)])
+
     pixel = H_inv @ world
     pixel /= pixel[2:3, :]
-    return pixel[0], pixel[1]
+    
+    if scene_name == 'univ':
+        px = native_w + pixel[0] - 30
+        py = native_h + pixel[1] - 30
+    else:
+        px = pixel[1]
+        py = pixel[0]
+
+    return px, py
 
 
 def convert_coordinates(scene_name, cfg, original_dir, target_w, target_h):
@@ -53,10 +66,10 @@ def convert_coordinates(scene_name, cfg, original_dir, target_w, target_h):
     obsmat_path = os.path.join(scene_dir, 'obsmat.txt')
     frame_ids, ped_ids, pos_x, pos_y = load_obsmat(obsmat_path)
 
-    H_path = os.path.join(scene_dir, 'H.txt')
-    px, py = world_to_pixel(H_path, pos_x, pos_y)
-
     native_w, native_h = cfg['native_res']
+    H_path = os.path.join(scene_dir, 'H.txt')
+    px, py = world_to_pixel(H_path, pos_x, pos_y, scene_name, native_w, native_h)
+
     if native_w != target_w or native_h != target_h:
         px = px * target_w / native_w
         py = py * target_h / native_h
