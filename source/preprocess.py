@@ -320,8 +320,10 @@ def generate_maps(output_dir, target_w, target_h):
     import matplotlib
     matplotlib.use('TkAgg')
     import matplotlib.pyplot as plt
-    from matplotlib.widgets import Button, PolygonSelector
+    from matplotlib.widgets import Button
     from matplotlib.path import Path as MplPath
+
+    pad = 40
 
     for scene_name in SCENES:
         scene_out = os.path.join(output_dir, scene_name)
@@ -342,51 +344,104 @@ def generate_maps(output_dir, target_w, target_h):
         else:
             area = np.ones((target_h, target_w), dtype=np.uint8)
 
-        state = {'mode': 'add', 'area': area, 'selector': None}
+        state = {'mode': 'remove', 'area': area, 'verts': []}
 
         fig, ax = plt.subplots(1, 1, figsize=(12, 9))
-        ax.imshow(bg_rgb)
-        overlay = np.zeros((*bg_rgb.shape[:2], 4))
-        overlay[:, :, 2] = 1.0
-        overlay[:, :, 3] = 0.3 * state['area']
-        mask_display = ax.imshow(overlay)
-        ax.set_title(f"{scene_name} - Mode: ADD walkable area "
-                     "(close window to save)")
+        ax.set_xlim(-pad, target_w + pad)
+        ax.set_ylim(target_h + pad, -pad)
+        ax.imshow(bg_rgb, extent=[0, target_w, target_h, 0])
+
+        overlay = np.zeros((target_h, target_w, 4))
+        overlay[:, :, 0] = 1.0
+        overlay[state['area'] == 0, 3] = 0.4
+        mask_display = ax.imshow(overlay, extent=[0, target_w, target_h, 0])
+
+        ax.set_title(f"{scene_name} - REMOVE mode | "
+                     "click to draw polygon, right-click to finish")
 
         def update_display():
-            overlay = np.zeros((*bg_rgb.shape[:2], 4))
-            overlay[:, :, 2] = 1.0
-            overlay[:, :, 3] = 0.3 * state['area']
+            overlay = np.zeros((target_h, target_w, 4))
+            overlay[:, :, 0] = 1.0
+            overlay[state['area'] == 0, 3] = 0.4
             mask_display.set_data(overlay)
             fig.canvas.draw_idle()
 
-        def on_select(verts):
-            path = MplPath(verts)
+        def clamp_verts(verts):
+            return [(np.clip(x, 0, target_w - 1), np.clip(y, 0, target_h - 1))
+                    for x, y in verts]
+
+        def apply_polygon():
+            if len(state['verts']) < 3:
+                state['verts'] = []
+                return
+            clamped = clamp_verts(state['verts'])
+            path = MplPath(clamped)
             yy, xx = np.mgrid[:target_h, :target_w]
             points = np.column_stack([xx.ravel(), yy.ravel()])
-            polygon_mask = path.contains_points(points).reshape(target_h,
-                                                                target_w)
+            polygon_mask = path.contains_points(points).reshape(
+                target_h, target_w)
             if state['mode'] == 'add':
                 state['area'] = np.clip(
                     state['area'] + polygon_mask.astype(np.uint8), 0, 1)
             else:
                 state['area'] = (state['area']
                                  * (~polygon_mask).astype(np.uint8))
+            state['verts'] = []
+            for line in state.get('preview_lines', []):
+                line.remove()
+            state['preview_lines'] = []
             update_display()
 
+        def on_click(event):
+            if event.inaxes != ax or event.dblclick:
+                return
+            if event.button == 1:
+                state['verts'].append((event.xdata, event.ydata))
+                xs = [v[0] for v in state['verts']]
+                ys = [v[1] for v in state['verts']]
+                for line in state.get('preview_lines', []):
+                    line.remove()
+                color = 'lime' if state['mode'] == 'add' else 'red'
+                line, = ax.plot(xs, ys, 'o-', color=color, markersize=4,
+                                linewidth=1.5)
+                state['preview_lines'] = [line]
+                fig.canvas.draw_idle()
+            elif event.button == 3:
+                apply_polygon()
+
         def toggle_mode(event):
-            state['mode'] = 'remove' if state['mode'] == 'add' else 'add'
-            ax.set_title(
-                f"{scene_name} - Mode: "
-                f"{'ADD' if state['mode'] == 'add' else 'REMOVE'} "
-                "walkable area")
+            state['mode'] = 'add' if state['mode'] == 'remove' else 'remove'
+            label = 'ADD' if state['mode'] == 'add' else 'REMOVE'
+            ax.set_title(f"{scene_name} - {label} mode | "
+                         "click to draw polygon, right-click to finish")
+            btn.label.set_text(f"Mode: {label}")
             fig.canvas.draw_idle()
 
-        ax_btn = plt.axes([0.4, 0.01, 0.2, 0.04])
-        btn = Button(ax_btn, 'Toggle Add/Remove')
+        def undo_last(event):
+            if state['verts']:
+                state['verts'].pop()
+                for line in state.get('preview_lines', []):
+                    line.remove()
+                state['preview_lines'] = []
+                if state['verts']:
+                    xs = [v[0] for v in state['verts']]
+                    ys = [v[1] for v in state['verts']]
+                    color = 'lime' if state['mode'] == 'add' else 'red'
+                    line, = ax.plot(xs, ys, 'o-', color=color, markersize=4,
+                                    linewidth=1.5)
+                    state['preview_lines'] = [line]
+                fig.canvas.draw_idle()
+
+        ax_btn = plt.axes([0.3, 0.01, 0.18, 0.04])
+        btn = Button(ax_btn, 'Mode: REMOVE')
         btn.on_clicked(toggle_mode)
 
-        state['selector'] = PolygonSelector(ax, on_select, useblit=True)
+        ax_undo = plt.axes([0.52, 0.01, 0.18, 0.04])
+        btn_undo = Button(ax_undo, 'Undo point')
+        btn_undo.on_clicked(undo_last)
+
+        state['preview_lines'] = []
+        fig.canvas.mpl_connect('button_press_event', on_click)
         plt.show()
 
         np.save(map_path, state['area'])
