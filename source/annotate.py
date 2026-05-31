@@ -192,7 +192,7 @@ def annotate_scenario(data_dir, api_key, base_url, subsets):
                     ],
                 }],
                 temperature=0.2,
-                max_tokens=300,
+                max_tokens=512,
             )
             description = resp.choices[0].message.content.strip()
         except Exception as e:
@@ -251,7 +251,7 @@ def annotate_crowd(data_dir, api_key, base_url, subsets):
                         ],
                     }],
                     temperature=0.2,
-                    max_tokens=500,
+                    max_tokens=4096,
                 )
                 description = resp.choices[0].message.content.strip()
             except Exception as e:
