@@ -564,8 +564,7 @@ def train(args):
     epoch_cb._trainer = trainer
 
     print(f"\nTraining: task={args.task_name}, backbone={backbone}, "
-          f"coord_tokens={use_coord}, physics={args.physics}, "
-          f"early_stopping={args.early_stopping}")
+          f"coord_tokens={use_coord}, physics={args.physics}")
 
     trainer.train()
     print("Training complete.")

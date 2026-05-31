@@ -13,43 +13,57 @@ RES_H=480
 RES_W=640
 SEED=42
 OUTPUT_BASE=./outputs
+
+# training config (must match training)
 EPOCHS=20
+COLLISION_W=0.001
+SMOOTHNESS_W=0.05
+WALKABLE_W=0.05
+
+# which checkpoint epoch to test
+EVAL_EPOCH=20
+
+# ── Task name suffix ──────────────────────────────────────────────
+SUFFIX="ep${EPOCHS}-c${COLLISION_W}-s${SMOOTHNESS_W}-w${WALKABLE_W}-${EVAL_EPOCH}"
 
 # ── 1. Main (coord tokens + physics) ─────────────────────────────
-echo "===== [1/3] Generate: main-${EPOCHS} ====="
+TASK="main-${SUFFIX}"
+echo "===== [1/3] Inference: ${TASK} ====="
 python source/inference.py \
     --data $DATA \
-    --task_name main-${EPOCHS} \
+    --task_name $TASK \
     --output_base $OUTPUT_BASE \
     --backbone $BACKBONE \
-    --checkpoint $OUTPUT_BASE/checkpoint/main/epoch_$EPOCHS \
+    --checkpoint $OUTPUT_BASE/checkpoint/$TASK/epoch_$EVAL_EPOCH \
     --max_seq_length $SEQ_LEN --max_new_tokens $MAX_NEW \
     --bin_size $BIN --resolution_h $RES_H --resolution_w $RES_W \
     --seed $SEED
 
 # ── 2. Ablation: coord tokens, no physics ────────────────────────
-echo "===== [2/3] Generate: ablation_no_physics-${EPOCHS} ====="
+TASK="ablation_no_physics-${SUFFIX}"
+echo "===== [2/3] Inference: ${TASK} ====="
 python source/inference.py \
     --data $DATA \
-    --task_name ablation_no_physics-${EPOCHS} \
+    --task_name $TASK \
     --output_base $OUTPUT_BASE \
     --backbone $BACKBONE \
-    --checkpoint $OUTPUT_BASE/checkpoint/ablation_no_physics/epoch_$EPOCHS \
+    --checkpoint $OUTPUT_BASE/checkpoint/$TASK/epoch_$EVAL_EPOCH \
     --max_seq_length $SEQ_LEN --max_new_tokens $MAX_NEW \
     --bin_size $BIN --resolution_h $RES_H --resolution_w $RES_W \
     --seed $SEED
 
 # ── 3. Ablation: raw numbers + physics ───────────────────────────
-echo "===== [3/3] Generate: ablation_raw_physics-${EPOCHS} ====="
+TASK="ablation_raw_physics-${SUFFIX}"
+echo "===== [3/3] Inference: ${TASK} ====="
 python source/inference.py \
     --data $DATA \
-    --task_name ablation_raw_physics-${EPOCHS} \
+    --task_name $TASK \
     --output_base $OUTPUT_BASE \
     --backbone $BACKBONE \
-    --checkpoint $OUTPUT_BASE/checkpoint/ablation_raw_physics/epoch_$EPOCHS \
+    --checkpoint $OUTPUT_BASE/checkpoint/$TASK/epoch_$EVAL_EPOCH \
     --max_seq_length $SEQ_LEN --max_new_tokens $MAX_NEW \
     --bin_size $BIN --resolution_h $RES_H --resolution_w $RES_W \
     --seed $SEED \
     --raw_mode
 
-echo "All generation complete."
+echo "All inference complete."

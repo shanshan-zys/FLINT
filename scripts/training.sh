@@ -25,11 +25,15 @@ SMOOTHNESS_W=0.05
 WALKABLE_W=0.05
 COLLISION_THRESH=10.0
 
+# ── Task name suffix ──────────────────────────────────────────────
+SUFFIX="ep${EPOCHS}-c${COLLISION_W}-s${SMOOTHNESS_W}-w${WALKABLE_W}"
+
 # ── 1. Main: coord tokens + full physics loss ─────────────────────
-echo "===== [1/3] Main experiment ====="
+TASK="main-${SUFFIX}"
+echo "===== [1/3] ${TASK} ====="
 python source/training.py \
     --data $DATA \
-    --task_name main \
+    --task_name $TASK \
     --output_base $OUTPUT_BASE \
     --use_coord_tokens \
     --physics all \
@@ -42,10 +46,11 @@ python source/training.py \
     --walkable_weight $WALKABLE_W --collision_threshold $COLLISION_THRESH
 
 # ── 2. Ablation: coord tokens, no physics loss ───────────────────
-echo "===== [2/3] Ablation: no physics ====="
+TASK="ablation_no_physics-${SUFFIX}"
+echo "===== [2/3] ${TASK} ====="
 python source/training.py \
     --data $DATA \
-    --task_name ablation_no_physics \
+    --task_name $TASK \
     --output_base $OUTPUT_BASE \
     --use_coord_tokens \
     --physics none \
@@ -56,10 +61,11 @@ python source/training.py \
     --seed $SEED
 
 # ── 3. Ablation: raw numbers + full physics loss ─────────────────
-echo "===== [3/3] Ablation: raw numbers + physics ====="
+TASK="ablation_raw_physics-${SUFFIX}"
+echo "===== [3/3] ${TASK} ====="
 python source/training.py \
     --data $DATA \
-    --task_name ablation_raw_physics \
+    --task_name $TASK \
     --output_base $OUTPUT_BASE \
     --no_coord_tokens \
     --use_raw_prompt \
