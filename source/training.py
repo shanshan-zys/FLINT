@@ -1,5 +1,5 @@
 """
-FLINT training: Unsloth + LoRA SFT with physics-aware loss.
+FLINT training: LoRA SFT with physics-aware loss.
 
 Supports:
   --use_coord_tokens / --no_coord_tokens   tokenizer mode
@@ -17,7 +17,13 @@ import numpy as np
 
 from datasets import Dataset
 from trl import SFTConfig, SFTTrainer
-from transformers import TrainerCallback, EarlyStoppingCallback
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    TrainerCallback,
+)
+from peft import LoraConfig, get_peft_model
 
 from dataset_construction import CoordTokenizer
 
@@ -82,16 +88,27 @@ def load_and_split(data_path, seed=42, use_raw_prompt=False):
 # ====================================================================
 # Model and tokenizer
 # ====================================================================
-def prepare_model_and_tokenizer(backbone, max_seq_length, use_coord_tokens,
+def prepare_model_and_tokenizer(backbone, use_coord_tokens,
                                 resolution, bin_size):
-    from unsloth import FastLanguageModel
-
-    model, llm_tokenizer = FastLanguageModel.from_pretrained(
-        model_name=backbone,
-        max_seq_length=max_seq_length,
-        dtype=None,
+    bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
     )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        backbone,
+        quantization_config=bnb_config,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+    )
+    llm_tokenizer = AutoTokenizer.from_pretrained(
+        backbone, trust_remote_code=True,
+    )
+    if llm_tokenizer.pad_token is None:
+        llm_tokenizer.pad_token = llm_tokenizer.eos_token
 
     coord_tok = None
     if use_coord_tokens:
@@ -100,15 +117,19 @@ def prepare_model_and_tokenizer(backbone, max_seq_length, use_coord_tokens,
         model.resize_token_embeddings(len(llm_tokenizer))
         print(f"Added {num_added} coordinate tokens")
 
-    model = FastLanguageModel.get_peft_model(
-        model,
+    model.enable_input_require_grads()
+    model.gradient_checkpointing_enable()
+
+    lora_config = LoraConfig(
         r=16, lora_alpha=32, lora_dropout=0.05,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                          "gate_proj", "up_proj", "down_proj"],
         bias="none",
-        use_gradient_checkpointing="unsloth",
+        task_type="CAUSAL_LM",
         modules_to_save=["embed_tokens", "lm_head"],
     )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
 
     return model, llm_tokenizer, coord_tok
 
@@ -426,7 +447,7 @@ class CheckpointCallback(TrainerCallback):
         )
         os.makedirs(ckpt_dir, exist_ok=True)
         trainer.model.save_pretrained(ckpt_dir)
-        trainer.tokenizer.save_pretrained(ckpt_dir)
+        trainer.processing_class.save_pretrained(ckpt_dir)
         self._last_saved_epoch = epoch
         print(f"Checkpoint saved: {ckpt_dir}")
 
@@ -468,7 +489,7 @@ def train(args):
     resolution = (args.resolution_h, args.resolution_w)
 
     # load data
-    train_ds, eval_ds, train_meta, _ = load_and_split(
+    train_ds, _, train_meta, _ = load_and_split(
         args.data, seed=args.seed, use_raw_prompt=args.use_raw_prompt
     )
 
@@ -480,7 +501,7 @@ def train(args):
         print(f"Loading base model from HuggingFace: {backbone}")
 
     model, llm_tokenizer, coord_tok = prepare_model_and_tokenizer(
-        backbone, args.max_seq_length, use_coord, resolution, args.bin_size
+        backbone, use_coord, resolution, args.bin_size
     )
 
     # physics loss
@@ -504,12 +525,6 @@ def train(args):
     epoch_cb = EpochEndCallback(loss_cb, ckpt_cb)
 
     callbacks = [epoch_cb]
-    if args.early_stopping:
-        callbacks.append(EarlyStoppingCallback(
-            early_stopping_patience=args.early_stopping_patience
-        ))
-
-    has_eval = len(eval_ds) > 0
 
     training_args = SFTConfig(
         output_dir=os.path.join(args.output_base, "runs", args.task_name),
@@ -521,14 +536,10 @@ def train(args):
         warmup_ratio=args.warmup_ratio,
         logging_steps=5,
         save_strategy="no",
-        eval_strategy="epoch" if has_eval else "no",
-        load_best_model_at_end=args.early_stopping and has_eval,
-        metric_for_best_model="eval_loss" if has_eval else None,
-        greater_is_better=False,
+        eval_strategy="no",
         fp16=not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_bf16_supported(),
-        max_seq_length=args.max_seq_length,
-        dataset_text_field="text",
+        max_length=args.max_seq_length,
         packing=False,
         report_to="tensorboard",
         seed=args.seed,
@@ -537,9 +548,8 @@ def train(args):
 
     trainer = FLINTTrainer(
         model=model,
-        tokenizer=llm_tokenizer,
+        processing_class=llm_tokenizer,
         train_dataset=train_ds,
-        eval_dataset=eval_ds if has_eval else None,
         args=training_args,
         callbacks=callbacks,
         physics_loss_fn=physics_loss_fn,
@@ -594,14 +604,10 @@ if __name__ == "__main__":
     parser.add_argument("--lr_scheduler", type=str, default="cosine")
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
 
-    # early stopping
-    parser.add_argument("--early_stopping", action="store_true")
-    parser.add_argument("--early_stopping_patience", type=int, default=3)
-
     # physics loss
     parser.add_argument("--physics", type=str, default="none",
                         choices=["none", "collision", "all"])
-    parser.add_argument("--collision_weight", type=float, default=0.1)
+    parser.add_argument("--collision_weight", type=float, default=0.001)
     parser.add_argument("--smoothness_weight", type=float, default=0.05)
     parser.add_argument("--walkable_weight", type=float, default=0.05)
     parser.add_argument("--collision_threshold", type=float, default=10.0)

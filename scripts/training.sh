@@ -20,14 +20,11 @@ SEED=42
 OUTPUT_BASE=./outputs
 
 # physics loss weights (adjustable)
-COLLISION_W=0.1
+COLLISION_W=0.001
 SMOOTHNESS_W=0.05
 WALKABLE_W=0.05
 COLLISION_THRESH=10.0
 
-# early stopping (set to --early_stopping to enable)
-EARLY_STOP=""
-ESP=3
 
 # ── 1. Main experiment: coord tokens + full physics loss ───────────
 echo "===== [1/4] Main experiment ====="
@@ -44,7 +41,6 @@ python source/training.py \
     --seed $SEED \
     --collision_weight $COLLISION_W --smoothness_weight $SMOOTHNESS_W \
     --walkable_weight $WALKABLE_W --collision_threshold $COLLISION_THRESH \
-    $EARLY_STOP ${EARLY_STOP:+--early_stopping_patience $ESP}
 
 # ── 2. Ablation: raw numbers (no coord tokens, raw_prompt) ────────
 echo "===== [2/4] Ablation: raw numbers ====="
@@ -60,7 +56,6 @@ python source/training.py \
     --learning_rate $LR --lr_scheduler $SCHED --warmup_ratio $WARMUP \
     --bin_size $BIN --resolution_h $RES_H --resolution_w $RES_W \
     --seed $SEED \
-    $EARLY_STOP ${EARLY_STOP:+--early_stopping_patience $ESP}
 
 # ── 3. Ablation: coord tokens, no physics loss ────────────────────
 echo "===== [3/4] Ablation: no physics ====="
@@ -75,7 +70,6 @@ python source/training.py \
     --learning_rate $LR --lr_scheduler $SCHED --warmup_ratio $WARMUP \
     --bin_size $BIN --resolution_h $RES_H --resolution_w $RES_W \
     --seed $SEED \
-    $EARLY_STOP ${EARLY_STOP:+--early_stopping_patience $ESP}
 
 # ── 4. Ablation: collision loss only ──────────────────────────────
 echo "===== [4/4] Ablation: collision only ====="
@@ -91,6 +85,5 @@ python source/training.py \
     --bin_size $BIN --resolution_h $RES_H --resolution_w $RES_W \
     --seed $SEED \
     --collision_weight $COLLISION_W --collision_threshold $COLLISION_THRESH \
-    $EARLY_STOP ${EARLY_STOP:+--early_stopping_patience $ESP}
 
 echo "All training runs complete."
