@@ -11,7 +11,7 @@ MAP_GRID=10
 TRAIN_RATIO=0.8
 
 # coord tokens (main model)
-python source/prepare_data.py \
+python source/dataset_construction.py \
     --annotations data/annotations.json \
     --output data/sft.json \
     --bin_size $BIN_SIZE \
@@ -20,13 +20,13 @@ python source/prepare_data.py \
     --processed_dir $PROCESSED_DIR \
     --map_grid_size $MAP_GRID
 
-python source/prepare_data.py \
+python source/dataset_construction.py \
     --split \
     --annotations data/sft.json \
     --train_ratio $TRAIN_RATIO
 
 # raw numbers (ablation)
-python source/prepare_data.py \
+python source/dataset_construction.py \
     --annotations data/annotations.json \
     --output data/sft_raw.json \
     --no_coord_tokens \
@@ -36,7 +36,7 @@ python source/prepare_data.py \
     --processed_dir $PROCESSED_DIR \
     --map_grid_size $MAP_GRID
 
-python source/prepare_data.py \
+python source/dataset_construction.py \
     --split \
     --annotations data/sft_raw.json \
     --train_ratio $TRAIN_RATIO

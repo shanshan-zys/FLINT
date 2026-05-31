@@ -9,9 +9,9 @@ Output structure per scene:
   data/processed/{scene}/{scene}.npy   (walkable area)
 
 Usage:
-  python preprocess.py --target_w 640 --target_h 480 --clip_len 25 --fps 2.5
-  python preprocess.py --generate_backgrounds --target_w 640 --target_h 480
-  python preprocess.py --generate_maps --target_w 640 --target_h 480
+  python preprocessing.py --target_w 640 --target_h 480 --clip_len 25 --fps 2.5
+  python preprocessing.py --generate_backgrounds --target_w 640 --target_h 480
+  python preprocessing.py --generate_maps --target_w 640 --target_h 480
 """
 
 import os

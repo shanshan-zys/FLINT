@@ -8,7 +8,7 @@ BASE_URL="http://llmapi.bilibili.co/v1"
 SUBSETS="eth hotel univ zara1 zara2"
 
 # Annotate scenario (background image + first clip trajectory samples)
-python source/annotate.py \
+python source/annotation.py \
     --annotate_scenario \
     --data_dir data/processed \
     --api_key "$API_KEY" \
@@ -16,7 +16,7 @@ python source/annotate.py \
     --subsets $SUBSETS
 
 # Annotate crowd dynamics (video + trajectory data)
-python source/annotate.py \
+python source/annotation.py \
     --annotate_crowd \
     --data_dir data/processed \
     --api_key "$API_KEY" \
