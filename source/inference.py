@@ -96,6 +96,29 @@ def parse_output_trajectory(generated_text, use_coord_tokens, coord_tok, populat
     return result
 
 
+COMPACT_KEYS = {"output_trajectory", "walkable_area", "trajectory"}
+
+
+def compact_json(obj, indent=2):
+    def _serialize(o, level):
+        pad = " " * (indent * level)
+        pad_inner = " " * (indent * (level + 1))
+        if isinstance(o, dict):
+            items = []
+            for k, v in o.items():
+                if k in COMPACT_KEYS:
+                    items.append(f'{pad_inner}{json.dumps(k)}: {json.dumps(v, separators=(",", ": "))}')
+                else:
+                    items.append(f'{pad_inner}{json.dumps(k)}: {_serialize(v, level + 1)}')
+            return "{\n" + ",\n".join(items) + f"\n{pad}}}"
+        elif isinstance(o, list) and o and isinstance(o[0], dict):
+            items = [f"{pad_inner}{_serialize(item, level + 1)}" for item in o]
+            return "[\n" + ",\n".join(items) + f"\n{pad}]"
+        else:
+            return json.dumps(o)
+    return _serialize(obj, 0) + "\n"
+
+
 def generate(args):
     use_coord = not args.raw_mode
     resolution = (args.resolution_h, args.resolution_w)
@@ -162,7 +185,7 @@ def generate(args):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{args.task_name}.json")
     with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
+        f.write(compact_json(results))
     print(f"\nResults saved: {out_path} ({len(results)} samples)")
 
 
