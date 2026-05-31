@@ -8,7 +8,7 @@ RES_H=480
 RES_W=640
 PROCESSED_DIR=data/processed
 MAP_GRID=10
-OUTPUT=data/eth-ucy/eth-ucy.json
+OUTPUT=data/eth-ucy-text.json
 
 python3 source/dataset_construction.py \
     --data_dir $PROCESSED_DIR \

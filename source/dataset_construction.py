@@ -209,6 +209,48 @@ def _format_initial_states(initial_states: Dict, ped_ids: List) -> str:
     return "\n".join(lines)
 
 
+def _is_numeric_list(obj):
+    if not isinstance(obj, list) or len(obj) == 0:
+        return False
+    first = obj[0]
+    if isinstance(first, (int, float)):
+        return True
+    if isinstance(first, list):
+        return _is_numeric_list(first)
+    return False
+
+
+def _json_dumps_compact_arrays(obj, indent=2):
+    """JSON serialize with indent, but keep purely numeric arrays on one line."""
+
+    def _compact(o):
+        if isinstance(o, list) and _is_numeric_list(o):
+            return json.dumps(o, ensure_ascii=False)
+        return None
+
+    def _encode(o, level):
+        pad = " " * (indent * level)
+        pad_inner = " " * (indent * (level + 1))
+        compact = _compact(o)
+        if compact is not None:
+            return compact
+        if isinstance(o, dict):
+            items = []
+            for k, v in o.items():
+                val_str = _encode(v, level + 1)
+                items.append(f"{pad_inner}{json.dumps(k, ensure_ascii=False)}: {val_str}")
+            return "{\n" + ",\n".join(items) + f"\n{pad}}}"
+        if isinstance(o, list):
+            items = []
+            for v in o:
+                val_str = _encode(v, level + 1)
+                items.append(f"{pad_inner}{val_str}")
+            return "[\n" + ",\n".join(items) + f"\n{pad}]"
+        return json.dumps(o, ensure_ascii=False)
+
+    return _encode(obj, 0) + "\n"
+
+
 def _load_walkable_grid(data_dir, subset, grid_size=10):
     map_path = os.path.join(data_dir, subset, f"{subset}.npy")
     if not os.path.exists(map_path):
@@ -315,7 +357,7 @@ def build_sft_dataset(data_dir: str, output_path: str,
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(sft_data, f, ensure_ascii=False, indent=2)
+        f.write(_json_dumps_compact_arrays(sft_data))
     print(f"Dataset: {len(sft_data)} samples -> {output_path}")
 
 
