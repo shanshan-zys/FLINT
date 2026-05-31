@@ -1,9 +1,8 @@
 """
-数据准备：加载 clip 数据 + coordinate tokenizer + SFT 数据集构建
+Dataset construction: load clip data + coordinate tokenizer + build SFT samples.
 
-支持两种输出模式：
-  1. coord tokens: <x_i><y_j> 特殊 token（主模型）
-  2. raw numbers: 45,30;12,55;0,0 逗号分隔坐标（消融对比）
+Main output uses coordinate tokens <x_i><y_j>; metadata.raw_prompt contains the
+ablation version with plain x,y;x,y;... format (separate instruction + output).
 """
 
 import os
@@ -13,6 +12,7 @@ import argparse
 import numpy as np
 from pathlib import Path
 from typing import List, Dict
+
 
 ABSENT = -1.0
 
@@ -111,7 +111,7 @@ def _extract_subset(clip_id):
     return m.group(1) if m else None
 
 
-def load_clip_file(txt_path, clip_length=25):
+def load_clip_file(txt_path):
     clip_id = Path(txt_path).stem
     subset = _extract_subset(clip_id)
     data = np.loadtxt(txt_path)
@@ -152,61 +152,47 @@ def load_clip_file(txt_path, clip_length=25):
     }
 
 
-def load_all_trajectories(data_dir: str, clip_length: int = 25) -> List[Dict]:
-    base = Path(data_dir)
-    all_clips = []
-    counts = {}
-    for scene_dir in sorted(base.iterdir()):
-        if not scene_dir.is_dir():
-            continue
-        traj_dir = scene_dir / 'trajectories'
-        if not traj_dir.exists():
-            continue
-        for f in sorted(traj_dir.glob("*.txt")):
-            clip = load_clip_file(str(f), clip_length)
-            all_clips.append(clip)
-            subset = clip["subset"]
-            counts[subset] = counts.get(subset, 0) + 1
-    for subset, count in sorted(counts.items()):
-        print(f"  {subset}: {count} clips")
-    print(f"Total: {len(all_clips)} clips")
-    return all_clips
+SFT_INSTRUCTION_COORD = """You are required to perform a crowd simulation task by generating individual pedestrian trajectories across continuous time frames within a given scenario. You will be provided with a walkable area map, a scenario description, a crowd dynamics description, population count, frame count, and initial states.
 
+The walkable area is represented as a {grid_w}x{grid_h} (Width x Height) binary grid, downsampled from the original {W}x{H} pixel scenario by a factor of {grid_size}. Each cell corresponds to a {grid_size}x{grid_size} pixel region. Cells marked 1 are walkable; cells marked 0 are obstacles. All generated positions must remain within walkable cells.
 
-SFT_INSTRUCTION_COORD = """You are a crowd simulation engine. Given scene context, walkable area, and initial conditions, generate realistic pedestrian trajectories as coordinate tokens.
+Not all individuals are present in the first frame. Some may enter the scene from walkable edges at later frames; infer their appearance time and entry position from the crowd dynamics description. Once an individual exits the scene, they are permanently absent and must not reappear in any subsequent frame. The total population, movement duration, motion patterns, and flow directions must be consistent with the provided descriptions.
 
-{walkable_area}
+Generate trajectories as a single unbroken string of coordinate tokens. Output is organized frame by frame: for each frame, output all pedestrians' positions sequentially (Ped 1, Ped 2, ..., Ped N), then proceed to the next frame. Each position is represented as a token pair <x_i><y_j>, where the coordinate origin is at the top-left corner, x increases from left to right (tokens <x_1> to <x_{x_bins}>, bin size {bin_size}), and y increases from top to bottom (tokens <y_1> to <y_{y_bins}>). Use <x_0><y_0> as a placeholder for frames where the individual has not yet appeared or has already left.
 
-Output rules:
-1. Output a SINGLE unbroken string of coordinate tokens, no spaces between tokens
-2. Use <x_i><y_j> for each pedestrian's position at each timestep
-3. Use <x_0><y_0> when a pedestrian has not appeared or has left the scene
-4. Order: for each timestep t=1..T, output all N pedestrians' positions sequentially
-5. Coordinate system: 640x480 image, x increases rightward (1 to {x_bins}), y increases downward (1 to {y_bins})
-6. Pedestrians must stay within the walkable area
-7. Do NOT add any explanation, only output the token string"""
+Example for N=3, T=2 (Ped 3 not yet appeared in frame 1, enters in frame 2):
+Frame 1: Ped1=<x_12><y_34> Ped2=<x_55><y_21> Ped3=<x_0><y_0>
+Frame 2: Ped1=<x_13><y_35> Ped2=<x_54><y_22> Ped3=<x_99><y_88>
+Actual output: <x_12><y_34><x_55><y_21><x_0><y_0><x_13><y_35><x_54><y_22><x_99><y_88>
 
-SFT_INSTRUCTION_RAW = """You are a crowd simulation engine. Given scene context, walkable area, and initial conditions, generate realistic pedestrian trajectories as numeric coordinates.
+Do not add any explanations, spaces, newlines, or text outside the token string."""
 
-{walkable_area}
+SFT_INSTRUCTION_RAW = """You are required to perform a crowd simulation task by generating individual pedestrian trajectories across continuous time frames within a given scenario. You will be provided with a walkable area map, a scenario description, a crowd dynamics description, population count, frame count, and initial states.
 
-Output rules:
-1. Output coordinates as comma-separated x,y pairs, with positions separated by semicolons
-2. Use 0,0 when a pedestrian has not appeared or has left the scene
-3. Order: for each timestep t=1..T, output all N pedestrians' positions sequentially
-4. Coordinate system: pixel coordinates in a 640x480 image (x: 0-639, y: 0-479)
-5. Pedestrians must stay within the walkable area
-6. Do NOT add any explanation, only output the coordinate string
-Example: 45,30;12,55;0,0;78,120"""
+The walkable area is represented as a {grid_w}x{grid_h} (Width x Height) binary grid, downsampled from the original {W}x{H} pixel scenario by a factor of {grid_size}. Each cell corresponds to a {grid_size}x{grid_size} pixel region. Cells marked 1 are walkable; cells marked 0 are obstacles. All generated positions must remain within walkable cells.
 
-SFT_INPUT_TEMPLATE = """Scenario: {scenario_description}
+Not all individuals are present in the first frame. Some may enter the scene from walkable edges at later frames; infer their appearance time and entry position from the crowd dynamics description. Once an individual exits the scene, they are permanently absent and must not reappear in any subsequent frame. The total population, movement duration, motion patterns, and flow directions must be consistent with the provided descriptions.
 
-Crowd dynamics: {crowd_dynamics}
+Generate trajectories as semicolon-separated coordinate pairs. Output is organized frame by frame: for each frame, output all pedestrians' positions sequentially (Ped 1, Ped 2, ..., Ped N), then proceed to the next frame. Each position is an x,y pair in pixel coordinates, where the coordinate origin is at the top-left corner, x increases from left to right (0 to {W}), and y increases from top to bottom (0 to {H}). Use 0,0 as a placeholder for frames where the individual has not yet appeared or has already left.
 
-Number of pedestrians: {num_pedestrians}
-Number of timesteps: {num_timesteps}
+Example for N=3, T=2 (Ped 3 not yet appeared in frame 1, enters in frame 2):
+Frame 1: Ped1=58,170 Ped2=274,105 Ped3=0,0
+Frame 2: Ped1=63,173 Ped2=268,108 Ped3=495,440
+Actual output: 58,170;274,105;0,0;63,173;268,108;495,440
 
-Initial states:
+Do not add any explanations, spaces, newlines, or text outside the coordinate string."""
+
+SFT_INPUT_TEMPLATE = """Walkable area:
+{walkable_grid}
+
+Scenario: {scenario_description}
+
+Crowd dynamics: {crowd_description}
+
+Population: {num_pedestrians}
+Frames: {num_frames}
+
+Initial states (frame 1):
 {initial_states}"""
 
 
@@ -219,218 +205,134 @@ def _format_initial_states(initial_states: Dict, ped_ids: List) -> str:
             vel = state.get("velocity", [0, 0])
             lines.append(f"  Ped {pid}: pos=({pos[0]:.1f},{pos[1]:.1f}), vel=({vel[0]:.1f},{vel[1]:.1f})")
         else:
-            lines.append(f"  Ped {pid}: not present in first frame")
+            lines.append(f"  Ped {pid}: enters later (not in frame 1)")
     return "\n".join(lines)
 
 
-def _load_walkable_grid(processed_dir, subset, grid_size=10):
-    map_path = os.path.join(processed_dir, subset, f"{subset}.npy")
+def _load_walkable_grid(data_dir, subset, grid_size=10):
+    map_path = os.path.join(data_dir, subset, f"{subset}.npy")
     if not os.path.exists(map_path):
-        return ""
+        return None, ""
     map_full = np.load(map_path)
     map_grid = map_full[::grid_size, ::grid_size]
-    h, w = map_grid.shape
     grid_str = "\n".join("".join(str(int(x)) for x in row) for row in map_grid)
-    return (f"The walkable area is represented as a {h}x{w} grid "
-            f"(each cell = {grid_size}x{grid_size} pixels in the 480x640 image).\n"
-            f"1 = walkable, 0 = obstacle:\n{grid_str}")
+    return map_full, grid_str
 
 
-def build_sft_dataset(annotations_path: str, config: dict, output_path: str, use_coord_tokens: bool = True):
-    with open(annotations_path) as f:
-        annotations = json.load(f)
+def build_sft_dataset(data_dir: str, output_path: str,
+                      bin_size: int = 5, resolution: tuple = (480, 640), map_grid_size: int = 10):
+    H, W = resolution
+    tokenizer = CoordTokenizer(resolution=resolution, bin_size=bin_size)
+    grid_h, grid_w = H // map_grid_size, W // map_grid_size
 
-    processed_dir = config["data"].get("processed_dir", "./data/processed")
-    grid_size = config["data"].get("map_grid_size", 10)
+    fmt_kwargs = dict(
+        W=W, H=H, grid_size=map_grid_size, grid_w=grid_w, grid_h=grid_h,
+    )
+    instruction_coord = SFT_INSTRUCTION_COORD.format(
+        **fmt_kwargs, bin_size=bin_size,
+        x_bins=tokenizer.x_bins, y_bins=tokenizer.y_bins,
+    )
+    instruction_raw = SFT_INSTRUCTION_RAW.format(**fmt_kwargs)
 
-    tokenizer = None
-    if use_coord_tokens:
-        tokenizer = CoordTokenizer(
-            resolution=tuple(config["data"]["resolution"]),
-            bin_size=config["tokenizer"]["bin_size"],
-        )
-
-    walkable_cache = {}
+    subsets = ["eth", "hotel", "univ", "zara1", "zara2"]
     sft_data = []
-    for ann in annotations:
-        subset = ann.get("subset", "")
-        if subset not in walkable_cache:
-            walkable_cache[subset] = _load_walkable_grid(processed_dir, subset, grid_size)
-        walkable_area = walkable_cache[subset]
 
-        if use_coord_tokens:
-            instruction = SFT_INSTRUCTION_COORD.format(
-                walkable_area=walkable_area,
-                x_bins=config["tokenizer"]["x_bins"],
-                y_bins=config["tokenizer"]["y_bins"],
+    for subset in subsets:
+        json_path = Path(data_dir) / subset / f"{subset}.json"
+        if not json_path.exists():
+            print(f"  {subset}: no annotation json, skipping")
+            continue
+
+        with open(json_path) as f:
+            ann = json.load(f)
+
+        scenario_desc = ann.get("scenario", "")
+        crowd_descs = ann.get("crowd", {})
+
+        map_full, grid_str = _load_walkable_grid(data_dir, subset, map_grid_size)
+        if map_full is None:
+            print(f"  {subset}: no walkable area map, skipping")
+            continue
+
+        traj_dir = Path(data_dir) / subset / "trajectories"
+        if not traj_dir.exists():
+            print(f"  {subset}: no trajectories dir, skipping")
+            continue
+
+        clip_count = 0
+        for txt_file in sorted(traj_dir.glob("*.txt")):
+            clip = load_clip_file(str(txt_file))
+            clip_id = clip["clip_id"]
+            crowd_desc = crowd_descs.get(clip_id, "")
+
+            ped_ids = sorted(clip["trajectories"].keys(), key=lambda x: int(x))
+            num_peds = len(ped_ids)
+            num_frames = clip["num_frames"]
+
+            traj_array = np.full((num_peds, num_frames, 2), ABSENT)
+            for i, pid in enumerate(ped_ids):
+                for t, pos in enumerate(clip["trajectories"][pid]):
+                    traj_array[i, t] = pos
+
+            initial_states_text = _format_initial_states(clip["initial_states"], ped_ids)
+
+            sft_input = SFT_INPUT_TEMPLATE.format(
+                scenario_description=scenario_desc,
+                crowd_description=crowd_desc,
+                num_pedestrians=num_peds,
+                num_frames=num_frames,
+                walkable_grid=grid_str,
+                initial_states=initial_states_text,
             )
-        else:
-            instruction = SFT_INSTRUCTION_RAW.format(walkable_area=walkable_area)
 
-        trajectories = ann["trajectories"]
-        ped_ids = sorted(trajectories.keys(), key=lambda x: int(x))
-        num_peds = len(ped_ids)
-        num_steps = max(len(v) for v in trajectories.values())
-
-        traj_array = np.full((num_peds, num_steps, 2), ABSENT)
-        for i, pid in enumerate(ped_ids):
-            for t, pos in enumerate(trajectories[pid]):
-                traj_array[i, t] = pos
-
-        if use_coord_tokens:
             tokens = tokenizer.tokenize(traj_array)
-            response = "".join(tokens)
-        else:
-            response = encode_raw_numbers(traj_array)
+            output_text = "".join(tokens)
 
-        initial_states_text = _format_initial_states(
-            ann.get("initial_states", {}), ped_ids
-        )
+            raw_output = encode_raw_numbers(traj_array)
 
-        sft_input = SFT_INPUT_TEMPLATE.format(
-            scenario_description=ann.get("scenario_description", ""),
-            crowd_dynamics=ann.get("crowd_dynamics", ""),
-            num_pedestrians=num_peds,
-            num_timesteps=num_steps,
-            initial_states=initial_states_text,
-        )
+            sft_data.append({
+                "instruction": instruction_coord,
+                "input": sft_input,
+                "output": output_text,
+                "metadata": {
+                    "clip_name": clip_id,
+                    "population": num_peds,
+                    "frames": num_frames,
+                    "walkable_area": map_full.tolist(),
+                    "scenario_description": scenario_desc,
+                    "crowd_description": crowd_desc,
+                    "trajectory": traj_array.tolist(),
+                    "raw_prompt": {
+                        "instruction": instruction_raw,
+                        "input": sft_input,
+                        "output": raw_output,
+                    },
+                },
+            })
+            clip_count += 1
 
-        sft_data.append({
-            "instruction": instruction,
-            "input": sft_input,
-            "output": response,
-            "metadata": {
-                "clip_id": ann["clip_id"],
-                "subset": subset,
-                "num_pedestrians": num_peds,
-                "num_timesteps": num_steps,
-                "use_coord_tokens": use_coord_tokens,
-            },
-        })
+        print(f"  {subset}: {clip_count} clips")
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(sft_data, f, ensure_ascii=False, indent=2)
-
-    print(f"SFT dataset: {len(sft_data)} samples → {output_path}")
-    return sft_data
-
-
-def split_train_test(sft_path: str, train_ratio: float = 0.8, seed: int = 42):
-    with open(sft_path) as f:
-        data = json.load(f)
-
-    def base_clip_id(clip_id):
-        return clip_id[:clip_id.rfind("_var")] if "_var" in clip_id else clip_id
-
-    base_ids = sorted(set(base_clip_id(d["metadata"]["clip_id"]) for d in data))
-    np.random.seed(seed)
-    np.random.shuffle(base_ids)
-
-    split_idx = int(len(base_ids) * train_ratio)
-    train_ids = set(base_ids[:split_idx])
-
-    train_data = [d for d in data if base_clip_id(d["metadata"]["clip_id"]) in train_ids]
-    test_data = [d for d in data if base_clip_id(d["metadata"]["clip_id"]) not in train_ids]
-
-    output_dir = str(Path(sft_path).parent)
-    train_path = f"{output_dir}/train.json"
-    test_path = f"{output_dir}/test.json"
-
-    with open(train_path, "w", encoding="utf-8") as f:
-        json.dump(train_data, f, ensure_ascii=False, indent=2)
-    with open(test_path, "w", encoding="utf-8") as f:
-        json.dump(test_data, f, ensure_ascii=False, indent=2)
-
-    print(f"Split: {len(train_data)} train, {len(test_data)} test")
-    return train_path, test_path
-
-
-def test_tokenizer(config):
-    print("=== Tokenizer Roundtrip Test ===")
-    tok = CoordTokenizer(
-        resolution=tuple(config["data"]["resolution"]),
-        bin_size=config["tokenizer"]["bin_size"],
-    )
-    print(f"Resolution: {tok.W}x{tok.H}, bin_size: {tok.bin_size}")
-    print(f"Vocab size: {len(tok.vocab)} ({tok.x_bins + 1} x-tokens + {tok.y_bins + 1} y-tokens)")
-
-    np.random.seed(42)
-    N, T = 5, 25
-    traj = np.random.rand(N, T, 2) * np.array([tok.W, tok.H])
-    traj[0, 10:15] = ABSENT
-    traj[2, 0:3] = ABSENT
-
-    tokens = tok.tokenize(traj)
-    recovered = tok.detokenize(tokens, N, T)
-
-    errors = []
-    for n in range(N):
-        for t in range(T):
-            if traj[n, t, 0] == ABSENT:
-                assert recovered[n, t, 0] == ABSENT, f"Absent mismatch at ({n},{t})"
-            else:
-                err = np.sqrt((traj[n, t, 0] - recovered[n, t, 0]) ** 2 +
-                              (traj[n, t, 1] - recovered[n, t, 1]) ** 2)
-                errors.append(err)
-
-    errors = np.array(errors)
-    print(f"Roundtrip error: mean={errors.mean():.2f}, max={errors.max():.2f}, "
-          f"expected max={tok.bin_size * np.sqrt(2) / 2:.2f}")
-
-    raw = encode_raw_numbers(traj)
-    recovered_raw = decode_raw_numbers(raw, N, T)
-    raw_errors = []
-    for n in range(N):
-        for t in range(T):
-            if traj[n, t, 0] == ABSENT:
-                continue
-            err = np.sqrt((traj[n, t, 0] - recovered_raw[n, t, 0]) ** 2 +
-                          (traj[n, t, 1] - recovered_raw[n, t, 1]) ** 2)
-            raw_errors.append(err)
-    raw_errors = np.array(raw_errors)
-    print(f"Raw number roundtrip error: mean={raw_errors.mean():.2f}, max={raw_errors.max():.2f}")
-    print("=== Test PASSED ===")
-
-
-def _build_config(args):
-    return {
-        "data": {
-            "resolution": [args.resolution_h, args.resolution_w],
-            "processed_dir": args.processed_dir,
-            "map_grid_size": args.map_grid_size,
-            "train_ratio": args.train_ratio,
-        },
-        "tokenizer": {
-            "bin_size": args.bin_size,
-            "x_bins": args.resolution_w // args.bin_size,
-            "y_bins": args.resolution_h // args.bin_size,
-        },
-    }
+    print(f"Dataset: {len(sft_data)} samples -> {output_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--annotations", type=str, help="Annotations JSON path")
-    parser.add_argument("--output", type=str, default="data/sft.json")
-    parser.add_argument("--no_coord_tokens", action="store_true")
-    parser.add_argument("--split", action="store_true", help="Split into train/test")
-    parser.add_argument("--test_tokenizer", action="store_true")
+    parser = argparse.ArgumentParser(description="Build SFT dataset from processed clips")
+    parser.add_argument("--data_dir", type=str, default="data/processed")
+    parser.add_argument("--output", type=str, default="data/eth-ucy/eth-ucy.json")
     parser.add_argument("--bin_size", type=int, default=5)
     parser.add_argument("--resolution_h", type=int, default=480)
     parser.add_argument("--resolution_w", type=int, default=640)
-    parser.add_argument("--processed_dir", type=str, default="data/processed")
     parser.add_argument("--map_grid_size", type=int, default=10)
-    parser.add_argument("--train_ratio", type=float, default=0.8)
     args = parser.parse_args()
 
-    config = _build_config(args)
-
-    if args.test_tokenizer:
-        test_tokenizer(config)
-    elif args.split:
-        split_train_test(args.annotations or args.output, args.train_ratio)
-    elif args.annotations:
-        build_sft_dataset(args.annotations, config, args.output, not args.no_coord_tokens)
-    else:
-        parser.print_help()
+    build_sft_dataset(
+        data_dir=args.data_dir,
+        output_path=args.output,
+        bin_size=args.bin_size,
+        resolution=(args.resolution_h, args.resolution_w),
+        map_grid_size=args.map_grid_size,
+    )
