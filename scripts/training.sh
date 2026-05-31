@@ -25,9 +25,8 @@ SMOOTHNESS_W=0.05
 WALKABLE_W=0.05
 COLLISION_THRESH=10.0
 
-
-# ── 1. Main experiment: coord tokens + full physics loss ───────────
-echo "===== [1/4] Main experiment ====="
+# ── 1. Main: coord tokens + full physics loss ─────────────────────
+echo "===== [1/3] Main experiment ====="
 python source/training.py \
     --data $DATA \
     --task_name main \
@@ -40,25 +39,10 @@ python source/training.py \
     --bin_size $BIN --resolution_h $RES_H --resolution_w $RES_W \
     --seed $SEED \
     --collision_weight $COLLISION_W --smoothness_weight $SMOOTHNESS_W \
-    --walkable_weight $WALKABLE_W --collision_threshold $COLLISION_THRESH \
+    --walkable_weight $WALKABLE_W --collision_threshold $COLLISION_THRESH
 
-# ── 2. Ablation: raw numbers (no coord tokens, raw_prompt) ────────
-echo "===== [2/4] Ablation: raw numbers ====="
-python source/training.py \
-    --data $DATA \
-    --task_name ablation_raw_numbers \
-    --output_base $OUTPUT_BASE \
-    --no_coord_tokens \
-    --use_raw_prompt \
-    --physics none \
-    --backbone $BACKBONE --max_seq_length $SEQ_LEN \
-    --epochs $EPOCHS --batch_size $BS --gradient_accumulation_steps $GA \
-    --learning_rate $LR --lr_scheduler $SCHED --warmup_ratio $WARMUP \
-    --bin_size $BIN --resolution_h $RES_H --resolution_w $RES_W \
-    --seed $SEED \
-
-# ── 3. Ablation: coord tokens, no physics loss ────────────────────
-echo "===== [3/4] Ablation: no physics ====="
+# ── 2. Ablation: coord tokens, no physics loss ───────────────────
+echo "===== [2/3] Ablation: no physics ====="
 python source/training.py \
     --data $DATA \
     --task_name ablation_no_physics \
@@ -69,21 +53,23 @@ python source/training.py \
     --epochs $EPOCHS --batch_size $BS --gradient_accumulation_steps $GA \
     --learning_rate $LR --lr_scheduler $SCHED --warmup_ratio $WARMUP \
     --bin_size $BIN --resolution_h $RES_H --resolution_w $RES_W \
-    --seed $SEED \
+    --seed $SEED
 
-# ── 4. Ablation: collision loss only ──────────────────────────────
-echo "===== [4/4] Ablation: collision only ====="
+# ── 3. Ablation: raw numbers + full physics loss ─────────────────
+echo "===== [3/3] Ablation: raw numbers + physics ====="
 python source/training.py \
     --data $DATA \
-    --task_name ablation_collision_only \
+    --task_name ablation_raw_physics \
     --output_base $OUTPUT_BASE \
-    --use_coord_tokens \
-    --physics collision \
+    --no_coord_tokens \
+    --use_raw_prompt \
+    --physics all \
     --backbone $BACKBONE --max_seq_length $SEQ_LEN \
     --epochs $EPOCHS --batch_size $BS --gradient_accumulation_steps $GA \
     --learning_rate $LR --lr_scheduler $SCHED --warmup_ratio $WARMUP \
     --bin_size $BIN --resolution_h $RES_H --resolution_w $RES_W \
     --seed $SEED \
-    --collision_weight $COLLISION_W --collision_threshold $COLLISION_THRESH \
+    --collision_weight $COLLISION_W --smoothness_weight $SMOOTHNESS_W \
+    --walkable_weight $WALKABLE_W --collision_threshold $COLLISION_THRESH
 
 echo "All training runs complete."
