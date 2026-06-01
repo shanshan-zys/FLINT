@@ -24,12 +24,13 @@ EPOCHS=20
 COLLISION_W=0.001
 SMOOTHNESS_W=0.05
 WALKABLE_W=0.05
+REGRESSION_W=0.01
 
 # which checkpoint epochs to test (comma-separated)
 EVAL_EPOCHS="0,5,10,15,20"
 
 # ── Name components ───────────────────────────────────────────────
-TRAIN_SUFFIX="ep${EPOCHS}-c${COLLISION_W}-s${SMOOTHNESS_W}-w${WALKABLE_W}"
+TRAIN_SUFFIX="ep${EPOCHS}-c${COLLISION_W}-s${SMOOTHNESS_W}-w${WALKABLE_W}-r${REGRESSION_W}"
 
 # ── 1. Main (coord tokens + CE + reg + physics) ──────────────────
 TRAIN_TASK="main-${TRAIN_SUFFIX}"

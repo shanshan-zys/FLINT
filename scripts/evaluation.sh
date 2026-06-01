@@ -8,6 +8,7 @@ EPOCHS=20
 COLLISION_W=0.001
 SMOOTHNESS_W=0.05
 WALKABLE_W=0.05
+REGRESSION_W=0.01
 
 DATA_DIR=data/processed
 OUTPUT_BASE=./outputs
@@ -16,7 +17,7 @@ OUTPUT_BASE=./outputs
 EVAL_EPOCHS="0,5,10,15,20"
 
 # ── Name components ───────────────────────────────────────────────
-TRAIN_SUFFIX="ep${EPOCHS}-c${COLLISION_W}-s${SMOOTHNESS_W}-w${WALKABLE_W}"
+TRAIN_SUFFIX="ep${EPOCHS}-c${COLLISION_W}-s${SMOOTHNESS_W}-w${WALKABLE_W}-r${REGRESSION_W}"
 
 # ── Feature flags (comment out to skip) ───────────────────────────
 METRICS="--metrics"

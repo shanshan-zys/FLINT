@@ -32,7 +32,7 @@ PEEK="--peek_inference"
 # PEEK=""
 
 # ── Task name suffix ──────────────────────────────────────────────
-SUFFIX="ep${EPOCHS}-c${COLLISION_W}-s${SMOOTHNESS_W}-w${WALKABLE_W}"
+SUFFIX="ep${EPOCHS}-c${COLLISION_W}-s${SMOOTHNESS_W}-w${WALKABLE_W}-r${REGRESSION_W}"
 
 # ── 1. Main: coord tokens + CE + regression + physics ────────────
 TASK="main-${SUFFIX}"
