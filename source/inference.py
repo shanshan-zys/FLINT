@@ -22,18 +22,36 @@ ABSENT = -1.0
 
 
 class CoordConstrainedLogitsProcessor(LogitsProcessor):
-    """Force generation to only pick from coord tokens or EOS."""
+    """Force x/y alternation: even steps allow only x tokens, odd steps only y tokens."""
 
-    def __init__(self, allowed_ids):
-        self.allowed_mask = None
-        self.allowed_ids = set(allowed_ids)
+    def __init__(self, x_token_ids, y_token_ids, eos_token_id):
+        self.x_ids = set(x_token_ids)
+        self.y_ids = set(y_token_ids)
+        self.eos_id = eos_token_id
+        self.x_mask = None
+        self.y_mask = None
+        self.prompt_len = None
+
+    def reset(self, prompt_len):
+        self.prompt_len = prompt_len
 
     def __call__(self, input_ids, scores):
-        if self.allowed_mask is None or self.allowed_mask.shape[-1] != scores.shape[-1]:
-            self.allowed_mask = torch.full_like(scores[0], float("-inf"))
-            for tid in self.allowed_ids:
-                self.allowed_mask[tid] = 0.0
-        return scores + self.allowed_mask.unsqueeze(0)
+        if self.x_mask is None or self.x_mask.shape[-1] != scores.shape[-1]:
+            vocab_size = scores.shape[-1]
+            self.x_mask = torch.full((vocab_size,), float("-inf"), device=scores.device)
+            self.y_mask = torch.full((vocab_size,), float("-inf"), device=scores.device)
+            for tid in self.x_ids:
+                self.x_mask[tid] = 0.0
+            for tid in self.y_ids:
+                self.y_mask[tid] = 0.0
+            self.x_mask[self.eos_id] = 0.0
+            self.y_mask[self.eos_id] = 0.0
+
+        generated_len = input_ids.shape[1] - self.prompt_len
+        if generated_len % 2 == 0:
+            return scores + self.x_mask.unsqueeze(0)
+        else:
+            return scores + self.y_mask.unsqueeze(0)
 
 
 def format_alpaca_prompt(sample: dict) -> str:
@@ -84,9 +102,9 @@ def load_model(backbone, checkpoint_path, use_coord_tokens, resolution, bin_size
     if use_coord_tokens:
         coord_tok = CoordTokenizer(resolution=resolution, bin_size=bin_size)
         model.resize_token_embeddings(len(tokenizer))
-        allowed_ids = tokenizer.convert_tokens_to_ids(coord_tok.vocab)
-        allowed_ids.append(tokenizer.eos_token_id)
-        logits_processor = CoordConstrainedLogitsProcessor(allowed_ids)
+        x_ids = tokenizer.convert_tokens_to_ids(coord_tok.x_tokens)
+        y_ids = tokenizer.convert_tokens_to_ids(coord_tok.y_tokens)
+        logits_processor = CoordConstrainedLogitsProcessor(x_ids, y_ids, tokenizer.eos_token_id)
 
     model = PeftModel.from_pretrained(model, checkpoint_path)
     model.eval()
@@ -170,6 +188,7 @@ def run_inference(model, tokenizer, coord_tok, logits_processor, test_samples, a
                 gen_kwargs["do_sample"] = False
 
             if logits_processor is not None:
+                logits_processor.reset(inputs.input_ids.shape[1])
                 gen_kwargs["logits_processor"] = [logits_processor]
 
             with torch.no_grad():
