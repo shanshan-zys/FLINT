@@ -6,9 +6,11 @@ Supports:
   --use_raw_prompt                         tokenizer ablation (metadata.raw_prompt)
   --physics none / collision / all         physics loss selection
   --task_name                              names output dirs under loss/ and checkpoint/
+  --infer_epochs 0,5,10,15,20             run inference at specified epochs
 """
 
 import os
+import re
 import json
 import random
 import torch
@@ -25,7 +27,10 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 
-from dataset_construction import CoordTokenizer
+from dataset_construction import CoordTokenizer, decode_raw_numbers
+
+
+ABSENT = -1.0
 
 
 # ====================================================================
@@ -45,10 +50,26 @@ def format_alpaca(sample: dict) -> str:
     )
 
 
+def format_alpaca_prompt(sample: dict) -> str:
+    return (
+        "Below is an instruction that describes a task, "
+        "paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n"
+        "### Instruction:\n"
+        f"{sample['instruction']}\n\n"
+        "### Input:\n"
+        f"{sample['input']}\n\n"
+        "### Response:\n"
+    )
+
+
 # ====================================================================
 # Data loading: single JSON, seed-42 split 8:2
+# Returns pre-tokenized dataset with input_ids constructed manually
+# to ensure coord tokens are single tokens (not BPE-split)
 # ====================================================================
-def load_and_split(data_path, seed=42, use_raw_prompt=False):
+def load_and_split(data_path, tokenizer, coord_tok, seed=42,
+                   use_raw_prompt=False, use_coord_tokens=True, max_seq_length=8192):
     with open(data_path) as f:
         raw = json.load(f)
 
@@ -58,14 +79,38 @@ def load_and_split(data_path, seed=42, use_raw_prompt=False):
     train_idx, eval_idx = indices[:split], indices[split:]
 
     def build(idx_list):
-        texts, sample_indices, metadata_list = [], [], []
+        all_input_ids, all_response_starts, sample_indices, metadata_list = [], [], [], []
         for new_i, orig_i in enumerate(idx_list):
             s = raw[orig_i]
             if use_raw_prompt:
                 fields = s["metadata"]["raw_prompt"]
             else:
                 fields = s
-            texts.append(format_alpaca(fields))
+
+            # Tokenize prompt (instruction + input + "### Response:\n")
+            prompt_text = format_alpaca_prompt(fields)
+            prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+
+            # Tokenize response: coord tokens via convert_tokens_to_ids (not BPE)
+            if use_coord_tokens:
+                output_text = fields["output"]
+                output_tokens = re.findall(r'<[xy]_\d+>', output_text)
+                response_ids = tokenizer.convert_tokens_to_ids(output_tokens)
+            else:
+                # raw mode: normal tokenization is fine for plain numbers
+                response_ids = tokenizer.encode(fields["output"], add_special_tokens=False)
+
+            response_start = len(prompt_ids)
+
+            # Combine: prompt + response + EOS
+            input_ids = prompt_ids + response_ids + [tokenizer.eos_token_id]
+
+            # Truncate if needed
+            if len(input_ids) > max_seq_length:
+                input_ids = input_ids[:max_seq_length]
+
+            all_input_ids.append(input_ids)
+            all_response_starts.append(response_start)
             sample_indices.append(new_i)
 
             meta = s["metadata"]
@@ -76,13 +121,27 @@ def load_and_split(data_path, seed=42, use_raw_prompt=False):
                 "walkable_area": meta["walkable_area"],
                 "trajectory": meta["trajectory"],
             })
-        ds = Dataset.from_dict({"text": texts, "sample_idx": sample_indices})
+
+        ds = Dataset.from_dict({
+            "input_ids": all_input_ids,
+            "response_start": all_response_starts,
+            "sample_idx": sample_indices,
+        })
         return ds, metadata_list
 
     train_ds, train_meta = build(train_idx)
     eval_ds, eval_meta = build(eval_idx)
     print(f"Data split (seed={seed}): train={len(train_ds)}, eval={len(eval_ds)}")
-    return train_ds, eval_ds, train_meta, eval_meta
+
+    # Print debug info for first sample
+    first_ids = train_ds[0]["input_ids"]
+    print(f"[DEBUG] First train sample: {len(first_ids)} tokens")
+    if use_coord_tokens and coord_tok:
+        new_token_start = len(tokenizer) - len(coord_tok.vocab)
+        coord_count = sum(1 for t in first_ids if t >= new_token_start)
+        print(f"[DEBUG] Coord tokens in first sample: {coord_count}")
+
+    return train_ds, eval_ds, train_meta, eval_meta, raw, eval_idx
 
 
 # ====================================================================
@@ -339,17 +398,39 @@ class PhysicsLoss:
 
 
 # ====================================================================
-# Custom data collator that preserves sample_idx
+# Custom data collator: completion-only loss + sample_idx passthrough
 # ====================================================================
-class CollatorWithIndex:
-    def __init__(self, base_collator):
-        self.base_collator = base_collator
+class CompletionOnlyCollator:
+    """Masks prompt labels to -100 using pre-computed response_start.
+    Also preserves sample_idx for physics loss."""
+
+    def __init__(self, pad_token_id):
+        self.pad_token_id = pad_token_id
 
     def __call__(self, features):
-        indices = [f.pop("sample_idx", -1) for f in features]
-        batch = self.base_collator(features)
-        batch["sample_indices"] = torch.tensor(indices, dtype=torch.long)
-        return batch
+        sample_indices = [f.pop("sample_idx", -1) for f in features]
+        response_starts = [f.pop("response_start", 0) for f in features]
+
+        max_len = max(len(f["input_ids"]) for f in features)
+        input_ids = torch.full((len(features), max_len), self.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(features), max_len), dtype=torch.long)
+        labels = torch.full((len(features), max_len), -100, dtype=torch.long)
+
+        for i, f in enumerate(features):
+            ids = f["input_ids"]
+            seq_len = len(ids)
+            input_ids[i, :seq_len] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[i, :seq_len] = 1
+            # Only compute loss on response tokens (after prompt)
+            resp_start = response_starts[i]
+            labels[i, resp_start:seq_len] = input_ids[i, resp_start:seq_len]
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "sample_indices": torch.tensor(sample_indices, dtype=torch.long),
+        }
 
 
 # ====================================================================
@@ -446,7 +527,7 @@ class CheckpointCallback(TrainerCallback):
             self.output_base, "checkpoint", self.task_name, f"epoch_{epoch}"
         )
         os.makedirs(ckpt_dir, exist_ok=True)
-        trainer.model.save_pretrained(ckpt_dir)
+        trainer.model.save_pretrained(ckpt_dir, save_embedding_layers=True)
         trainer.processing_class.save_pretrained(ckpt_dir)
         self._last_saved_epoch = epoch
         print(f"Checkpoint saved: {ckpt_dir}")
@@ -461,19 +542,167 @@ class CheckpointCallback(TrainerCallback):
 
 
 # ====================================================================
-# Epoch tracking callback (drives loss-log and checkpoint)
+# Mid-training inference
+# ====================================================================
+def parse_output_trajectory(generated_text, use_coord_tokens, coord_tok, population, frames):
+    if use_coord_tokens:
+        tokens = re.findall(r'<[xy]_\d+>', generated_text)
+        traj = coord_tok.detokenize(tokens, population, frames)
+    else:
+        traj = decode_raw_numbers(generated_text, population, frames)
+
+    result = []
+    for n in range(population):
+        ped_traj = []
+        for t in range(frames):
+            x, y = traj[n, t, 0], traj[n, t, 1]
+            if x == ABSENT or y == ABSENT:
+                ped_traj.append([-1.0, -1.0])
+            else:
+                ped_traj.append([float(x), float(y)])
+        result.append(ped_traj)
+    return result
+
+
+COMPACT_KEYS = {"output_trajectories", "walkable_area", "trajectory"}
+
+
+def compact_json(obj, indent=2):
+    def _serialize(o, level):
+        pad = " " * (indent * level)
+        pad_inner = " " * (indent * (level + 1))
+        if isinstance(o, dict):
+            items = []
+            for k, v in o.items():
+                if k in COMPACT_KEYS:
+                    items.append(f'{pad_inner}{json.dumps(k)}: {json.dumps(v, separators=(",", ": "))}')
+                else:
+                    items.append(f'{pad_inner}{json.dumps(k)}: {_serialize(v, level + 1)}')
+            return "{\n" + ",\n".join(items) + f"\n{pad}}}"
+        elif isinstance(o, list) and o and isinstance(o[0], dict):
+            items = [f"{pad_inner}{_serialize(item, level + 1)}" for item in o]
+            return "[\n" + ",\n".join(items) + f"\n{pad}]"
+        else:
+            return json.dumps(o)
+    return _serialize(obj, 0) + "\n"
+
+
+def run_inference_at_epoch(trainer, tokenizer, coord_tok, test_samples,
+                           use_coord, use_raw_prompt, epoch,
+                           task_name, output_base, max_new_tokens, max_seq_length):
+    """Run inference on test split using the current model state."""
+    print(f"\n{'='*60}")
+    print(f"  Mid-training inference at epoch {epoch}")
+    print(f"{'='*60}")
+
+    model = trainer.model
+    was_training = model.training
+    model.eval()
+
+    # modules_to_save (embed_tokens, lm_head) may be in float32 while
+    # hidden states are bfloat16, causing dtype mismatch during generate
+    model.to(dtype=torch.bfloat16)
+
+    model.generation_config.temperature = None
+    model.generation_config.top_p = None
+    model.generation_config.top_k = None
+
+    results = []
+    for idx, sample in enumerate(test_samples):
+        meta = sample["metadata"]
+
+        if use_raw_prompt:
+            fields = meta["raw_prompt"]
+        else:
+            fields = sample
+
+        prompt = format_alpaca_prompt(fields)
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
+                           max_length=max_seq_length).to(model.device)
+
+        with torch.no_grad():
+            output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                        do_sample=False)
+
+        new_ids = output_ids[0][inputs.input_ids.shape[1]:]
+
+        think_token = tokenizer.convert_tokens_to_ids("<think>")
+        end_think_token = tokenizer.convert_tokens_to_ids("</think>")
+        if think_token is not None and think_token in new_ids:
+            try:
+                end_pos = new_ids.tolist().index(end_think_token)
+                new_ids = new_ids[end_pos + 1:]
+            except ValueError:
+                pass
+
+        generated_text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+
+        if idx == 0:
+            raw_text = tokenizer.decode(
+                output_ids[0][inputs.input_ids.shape[1]:],
+                skip_special_tokens=False,
+            ).strip()
+            print(f"[DEBUG epoch {epoch}] Raw generated (first 500 chars):\n{raw_text[:500]}")
+            print(f"[DEBUG epoch {epoch}] Cleaned text (first 500 chars):\n{generated_text[:500]}")
+            if use_coord:
+                coord_tokens = re.findall(r'<[xy]_\d+>', generated_text)
+                print(f"[DEBUG epoch {epoch}] Coord tokens found: {len(coord_tokens)}, "
+                      f"expected: {meta['population'] * meta['frames'] * 2}")
+            else:
+                parts = generated_text.strip().split(";")
+                print(f"[DEBUG epoch {epoch}] Raw number parts found: {len(parts)}, "
+                      f"expected: {meta['population'] * meta['frames']}")
+
+        traj = parse_output_trajectory(
+            generated_text, use_coord, coord_tok,
+            meta["population"], meta["frames"]
+        )
+
+        result = {
+            "clip_id": meta["clip_name"],
+            "output_trajectories": [traj],
+            "metadata": {
+                "population": meta["population"],
+                "frames": meta["frames"],
+                "walkable_area": meta["walkable_area"],
+                "scenario_description": meta["scenario_description"],
+                "crowd_description": meta["crowd_description"],
+                "trajectory": meta["trajectory"],
+            }
+        }
+        results.append(result)
+
+        print(f"  [{idx+1}/{len(test_samples)}] {meta['clip_name']} "
+              f"(pop={meta['population']}, frames={meta['frames']})")
+
+    out_dir = os.path.join(output_base, "results")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{task_name}-{epoch}.json")
+    with open(out_path, "w") as f:
+        f.write(compact_json(results))
+    print(f"Inference results saved: {out_path} ({len(results)} samples)")
+
+    if was_training:
+        model.train()
+
+
+# ====================================================================
+# Epoch tracking callback (drives loss-log, checkpoint, and inference)
 # ====================================================================
 class EpochEndCallback(TrainerCallback):
 
-    def __init__(self, loss_cb, ckpt_cb):
+    def __init__(self, loss_cb, ckpt_cb, infer_fn=None):
         self.loss_cb = loss_cb
         self.ckpt_cb = ckpt_cb
+        self.infer_fn = infer_fn
 
     def on_epoch_end(self, _args, state, _control, **_kwargs):
         epoch = int(round(state.epoch))
         if hasattr(self, "_trainer"):
             self.loss_cb.log_epoch(self._trainer, epoch)
             self.ckpt_cb.save_if_needed(self._trainer, epoch)
+            if self.infer_fn is not None:
+                self.infer_fn(self._trainer, epoch)
 
     def on_train_end(self, _args, state, _control, **_kwargs):
         epoch = int(round(state.epoch))
@@ -488,12 +717,7 @@ def train(args):
     use_coord = not args.no_coord_tokens
     resolution = (args.resolution_h, args.resolution_w)
 
-    # load data
-    train_ds, _, train_meta, _ = load_and_split(
-        args.data, seed=args.seed, use_raw_prompt=args.use_raw_prompt
-    )
-
-    # model
+    # model (must be before data loading so tokenizer is available)
     backbone = args.backbone
     if os.path.isdir(backbone):
         print(f"Loading base model from local path: {backbone}")
@@ -502,6 +726,13 @@ def train(args):
 
     model, llm_tokenizer, coord_tok = prepare_model_and_tokenizer(
         backbone, use_coord, resolution, args.bin_size
+    )
+
+    # load data (pre-tokenized with coord tokens handled correctly)
+    train_ds, _, train_meta, _, raw_data, test_idx = load_and_split(
+        args.data, llm_tokenizer, coord_tok, seed=args.seed,
+        use_raw_prompt=args.use_raw_prompt, use_coord_tokens=use_coord,
+        max_seq_length=args.max_seq_length,
     )
 
     # physics loss
@@ -519,10 +750,28 @@ def train(args):
         enabled = [k for k, v in physics_config.items() if "weight" in k and v > 0]
         print(f"Physics loss enabled: {enabled}")
 
+    # prepare inference callback
+    infer_fn = None
+    infer_epochs = set()
+    if args.infer_epochs:
+        infer_epochs = set(int(x.strip()) for x in args.infer_epochs.split(","))
+        test_samples = [raw_data[i] for i in test_idx]
+        print(f"Mid-training inference enabled at epochs: {sorted(infer_epochs)}")
+        print(f"Test samples for inference: {len(test_samples)}")
+
+        def infer_fn(trainer, epoch):
+            if epoch in infer_epochs:
+                run_inference_at_epoch(
+                    trainer, llm_tokenizer, coord_tok, test_samples,
+                    use_coord, args.use_raw_prompt, epoch,
+                    args.task_name, args.output_base,
+                    args.max_new_tokens, args.max_seq_length,
+                )
+
     # callbacks
     loss_cb = LossLogCallback(args.task_name, args.output_base)
     ckpt_cb = CheckpointCallback(args.task_name, args.output_base, save_interval=5)
-    epoch_cb = EpochEndCallback(loss_cb, ckpt_cb)
+    epoch_cb = EpochEndCallback(loss_cb, ckpt_cb, infer_fn=infer_fn)
 
     callbacks = [epoch_cb]
 
@@ -539,11 +788,11 @@ def train(args):
         eval_strategy="no",
         fp16=not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_bf16_supported(),
-        max_length=args.max_seq_length,
         packing=False,
         report_to="tensorboard",
         seed=args.seed,
         remove_unused_columns=False,
+        dataset_text_field=None,
     )
 
     trainer = FLINTTrainer(
@@ -557,11 +806,30 @@ def train(args):
         output_base=args.output_base,
     )
 
-    # wrap collator to pass sample_idx through
-    trainer.data_collator = CollatorWithIndex(trainer.data_collator)
+    # Collator uses pre-computed response_start to mask prompt labels
+    trainer.data_collator = CompletionOnlyCollator(llm_tokenizer.pad_token_id)
+
+    # Verify label masking on first sample
+    sample_feature = train_ds[0]
+    test_batch = trainer.data_collator([{k: v for k, v in sample_feature.items()}])
+    n_loss = (test_batch["labels"][0] != -100).sum().item()
+    n_all = (test_batch["attention_mask"][0] == 1).sum().item()
+    print(f"[Collator] First sample: {n_all} tokens, {n_loss} with loss "
+          f"({100*n_loss/max(n_all,1):.1f}% response)")
+    if n_loss == 0:
+        print("[WARNING] No tokens have loss! Check response_start values.")
 
     # attach trainer ref so callbacks can access it
     epoch_cb._trainer = trainer
+
+    # run epoch-0 inference (before any training) if requested
+    if 0 in infer_epochs:
+        run_inference_at_epoch(
+            trainer, llm_tokenizer, coord_tok, test_samples,
+            use_coord, args.use_raw_prompt, 0,
+            args.task_name, args.output_base,
+            args.max_new_tokens, args.max_seq_length,
+        )
 
     print(f"\nTraining: task={args.task_name}, backbone={backbone}, "
           f"coord_tokens={use_coord}, physics={args.physics}")
@@ -594,6 +862,7 @@ if __name__ == "__main__":
     # model
     parser.add_argument("--backbone", type=str, default="Qwen/Qwen3-8B-Instruct")
     parser.add_argument("--max_seq_length", type=int, default=8192)
+    parser.add_argument("--max_new_tokens", type=int, default=4096)
 
     # training
     parser.add_argument("--epochs", type=int, default=20)
@@ -610,6 +879,10 @@ if __name__ == "__main__":
     parser.add_argument("--smoothness_weight", type=float, default=0.05)
     parser.add_argument("--walkable_weight", type=float, default=0.05)
     parser.add_argument("--collision_threshold", type=float, default=10.0)
+
+    # mid-training inference
+    parser.add_argument("--infer_epochs", type=str, default=None,
+                        help="Comma-separated epochs to run inference, e.g. '0,5,10,15,20'")
 
     args = parser.parse_args()
     train(args)

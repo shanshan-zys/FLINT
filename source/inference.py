@@ -78,7 +78,7 @@ def load_model(backbone, checkpoint_path, use_coord_tokens, resolution, bin_size
 
 def parse_output_trajectory(generated_text, use_coord_tokens, coord_tok, population, frames):
     if use_coord_tokens:
-        tokens = re.findall(r'<[^>]+>', generated_text)
+        tokens = re.findall(r'<[xy]_\d+>', generated_text)
         traj = coord_tok.detokenize(tokens, population, frames)
     else:
         traj = decode_raw_numbers(generated_text, population, frames)
@@ -96,7 +96,7 @@ def parse_output_trajectory(generated_text, use_coord_tokens, coord_tok, populat
     return result
 
 
-COMPACT_KEYS = {"output_trajectory", "walkable_area", "trajectory"}
+COMPACT_KEYS = {"output_trajectories", "walkable_area", "trajectory"}
 
 
 def compact_json(obj, indent=2):
@@ -119,21 +119,11 @@ def compact_json(obj, indent=2):
     return _serialize(obj, 0) + "\n"
 
 
-def generate(args):
-    use_coord = not args.raw_mode
-    resolution = (args.resolution_h, args.resolution_w)
-
-    test_samples = get_test_split(args.data, seed=args.seed)
-    print(f"Test split (seed={args.seed}): {len(test_samples)} samples")
-
-    model, tokenizer, coord_tok = load_model(
-        args.backbone, args.checkpoint, use_coord, resolution,
-        args.bin_size, args.max_seq_length
-    )
-    print(f"Model loaded: backbone={args.backbone}, checkpoint={args.checkpoint}")
+def run_inference(model, tokenizer, coord_tok, test_samples, args, use_coord, task_name, checkpoint_label):
+    """Run inference on test split, save results."""
+    print(f"\nRunning inference: {task_name} (checkpoint: {checkpoint_label})")
 
     results = []
-
     for idx, sample in enumerate(test_samples):
         meta = sample["metadata"]
 
@@ -143,30 +133,63 @@ def generate(args):
             fields = sample
 
         prompt = format_alpaca_prompt(fields)
-
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
                            max_length=args.max_seq_length).to(model.device)
 
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
+        all_trajectories = []
+        for k in range(args.num_samples):
+            gen_kwargs = dict(
                 max_new_tokens=args.max_new_tokens,
-                do_sample=False,
             )
+            if args.num_samples > 1:
+                gen_kwargs["do_sample"] = True
+                gen_kwargs["temperature"] = args.temperature
+                gen_kwargs["top_p"] = args.top_p
+            else:
+                gen_kwargs["do_sample"] = False
 
-        generated_text = tokenizer.decode(
-            output_ids[0][inputs.input_ids.shape[1]:],
-            skip_special_tokens=True,
-        ).strip()
+            with torch.no_grad():
+                output_ids = model.generate(**inputs, **gen_kwargs)
 
-        output_trajectory = parse_output_trajectory(
-            generated_text, use_coord, coord_tok,
-            meta["population"], meta["frames"]
-        )
+            new_ids = output_ids[0][inputs.input_ids.shape[1]:]
+            think_token = tokenizer.convert_tokens_to_ids("<think>")
+            end_think_token = tokenizer.convert_tokens_to_ids("</think>")
+            if think_token is not None and think_token in new_ids:
+                try:
+                    end_pos = new_ids.tolist().index(end_think_token)
+                    new_ids = new_ids[end_pos + 1:]
+                except ValueError:
+                    pass
+
+            generated_text = tokenizer.decode(
+                new_ids, skip_special_tokens=True,
+            ).strip()
+
+            if idx == 0 and k == 0:
+                raw_text = tokenizer.decode(
+                    output_ids[0][inputs.input_ids.shape[1]:],
+                    skip_special_tokens=False,
+                ).strip()
+                print(f"[DEBUG] Raw generated (first 500 chars):\n{raw_text[:500]}")
+                print(f"[DEBUG] Cleaned text (first 500 chars):\n{generated_text[:500]}")
+                if use_coord:
+                    coord_tokens = re.findall(r'<[xy]_\d+>', generated_text)
+                    print(f"[DEBUG] Coord tokens found: {len(coord_tokens)}, "
+                          f"expected: {meta['population'] * meta['frames'] * 2}")
+                else:
+                    parts = generated_text.strip().split(";")
+                    print(f"[DEBUG] Raw number parts found: {len(parts)}, "
+                          f"expected: {meta['population'] * meta['frames']}")
+
+            traj = parse_output_trajectory(
+                generated_text, use_coord, coord_tok,
+                meta["population"], meta["frames"]
+            )
+            all_trajectories.append(traj)
 
         result = {
             "clip_id": meta["clip_name"],
-            "output_trajectory": output_trajectory,
+            "output_trajectories": all_trajectories,
             "metadata": {
                 "population": meta["population"],
                 "frames": meta["frames"],
@@ -179,14 +202,56 @@ def generate(args):
         results.append(result)
 
         print(f"[{idx+1}/{len(test_samples)}] {meta['clip_name']} "
-              f"(pop={meta['population']}, frames={meta['frames']})")
+              f"(pop={meta['population']}, frames={meta['frames']}, "
+              f"samples={args.num_samples})")
 
     out_dir = os.path.join(args.output_base, "results")
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{args.task_name}.json")
+    out_path = os.path.join(out_dir, f"{task_name}.json")
     with open(out_path, "w") as f:
         f.write(compact_json(results))
-    print(f"\nResults saved: {out_path} ({len(results)} samples)")
+    print(f"Results saved: {out_path} ({len(results)} samples)")
+
+
+def generate(args):
+    use_coord = not args.raw_mode
+    resolution = (args.resolution_h, args.resolution_w)
+
+    test_samples = get_test_split(args.data, seed=args.seed)
+    print(f"Test split (seed={args.seed}): {len(test_samples)} samples")
+
+    eval_epochs = [int(x.strip()) for x in args.eval_epochs.split(",")]
+    print(f"Eval epochs: {eval_epochs}")
+
+    for ep in eval_epochs:
+        checkpoint_path = os.path.join(
+            args.output_base, "checkpoint", args.train_task, f"epoch_{ep}"
+        )
+        if not os.path.isdir(checkpoint_path):
+            print(f"\nSkipping epoch {ep}: checkpoint not found at {checkpoint_path}")
+            continue
+
+        task_name = f"{args.task_name_base}-{ep}"
+
+        print(f"\n{'='*60}")
+        print(f"  Epoch {ep}: loading {checkpoint_path}")
+        print(f"{'='*60}")
+
+        model, tokenizer, coord_tok = load_model(
+            args.backbone, checkpoint_path, use_coord, resolution,
+            args.bin_size, args.max_seq_length
+        )
+        print(f"Sampling: num_samples={args.num_samples}, "
+              f"do_sample={'True' if args.num_samples > 1 else 'False'}, "
+              f"temperature={args.temperature}, top_p={args.top_p}")
+
+        run_inference(model, tokenizer, coord_tok, test_samples,
+                      args, use_coord, task_name, f"epoch_{ep}")
+
+        del model
+        torch.cuda.empty_cache()
+
+    print("\nAll inference complete.")
 
 
 if __name__ == "__main__":
@@ -194,15 +259,23 @@ if __name__ == "__main__":
 
     parser.add_argument("--data", type=str, required=True,
                         help="Path to eth-ucy-text.json")
-    parser.add_argument("--task_name", type=str, required=True)
+    parser.add_argument("--task_name_base", type=str, required=True,
+                        help="Base task name (epoch suffix appended automatically)")
+    parser.add_argument("--train_task", type=str, required=True,
+                        help="Training task name (for checkpoint path)")
+    parser.add_argument("--eval_epochs", type=str, default="20",
+                        help="Comma-separated epochs to evaluate, e.g. '0,5,10,15,20'")
     parser.add_argument("--output_base", type=str, default="./outputs")
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--backbone", type=str, default="Qwen/Qwen3-8B")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to LoRA checkpoint directory")
     parser.add_argument("--max_seq_length", type=int, default=8192)
     parser.add_argument("--max_new_tokens", type=int, default=4096)
+
+    parser.add_argument("--num_samples", type=int, default=1,
+                        help="Number of trajectory samples per clip")
+    parser.add_argument("--temperature", type=float, default=0.4)
+    parser.add_argument("--top_p", type=float, default=0.9)
 
     parser.add_argument("--raw_mode", action="store_true",
                         help="Use raw number format (no coord tokens)")
