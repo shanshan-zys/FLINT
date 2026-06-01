@@ -8,11 +8,11 @@ DATA=data/eth-ucy-text.json
 BACKBONE=/mnt/oss-write/opensource_models/Qwen3-8B
 SEQ_LEN=8192
 MAX_NEW=4096
-EPOCHS=20
+EPOCHS=30
 BS=4
-GA=4
-LR=1e-4
-SCHED=cosine
+GA=1
+LR=2e-4
+SCHED=linear
 WARMUP=0.05
 BIN=5
 RES_H=480
@@ -21,11 +21,11 @@ SEED=42
 OUTPUT_BASE=./outputs
 
 # loss weights
-COLLISION_W=0.001
-SMOOTHNESS_W=0.05
-WALKABLE_W=0.05
+COLLISION_W=0.01
+SMOOTHNESS_W=0.01
+WALKABLE_W=0.01
 REGRESSION_W=0.01
-COLLISION_THRESH=10.0
+COLLISION_THRESH=5.0
 
 # mid-training observation (comment out to disable)
 PEEK="--peek_inference"

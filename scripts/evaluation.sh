@@ -4,9 +4,9 @@ set -e
 cd "$(dirname "$0")/.."
 
 # ── Common parameters (must match training & inference) ───────────
-EPOCHS=20
+EPOCHS=30
 COLLISION_W=0.001
-SMOOTHNESS_W=0.05
+SMOOTHNESS_W=0.01
 WALKABLE_W=0.05
 REGRESSION_W=0.01
 
@@ -14,7 +14,7 @@ DATA_DIR=data/processed
 OUTPUT_BASE=./outputs
 
 # which checkpoint epochs to evaluate (comma-separated)
-EVAL_EPOCHS="0,5,10,15,20"
+EVAL_EPOCHS="0,5,10,15,20,25,30"
 
 # ── Name components ───────────────────────────────────────────────
 TRAIN_SUFFIX="ep${EPOCHS}-c${COLLISION_W}-s${SMOOTHNESS_W}-w${WALKABLE_W}-r${REGRESSION_W}"

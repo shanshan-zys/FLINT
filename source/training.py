@@ -673,7 +673,6 @@ def peek_generate_one(trainer, tokenizer, coord_tok, sample,
     model = trainer.model
     was_training = model.training
     model.eval()
-    model.to(dtype=torch.bfloat16)
 
     model.generation_config.temperature = None
     model.generation_config.top_p = None
@@ -689,7 +688,7 @@ def peek_generate_one(trainer, tokenizer, coord_tok, sample,
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
                        max_length=max_seq_length).to(model.device)
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
         output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens,
                                     do_sample=False)
 
