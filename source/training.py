@@ -204,9 +204,11 @@ class PhysicsLoss:
         self.collision_weight = config["collision_weight"]
         self.smoothness_weight = config["smoothness_weight"]
         self.walkable_weight = config["walkable_weight"]
+        self.regression_weight = config.get("regression_weight", 0.0)
         self.collision_threshold = config["collision_threshold"]
 
-        bin_size = coord_tok.bin_size
+        self.bin_size = coord_tok.bin_size
+        bin_size = self.bin_size
         x_bins = coord_tok.x_bins
         y_bins = coord_tok.y_bins
 
@@ -236,6 +238,16 @@ class PhysicsLoss:
 
         self.x_id_set = set(self.x_token_ids + [self.x0_id])
         self.y_id_set = set(self.y_token_ids + [self.y0_id])
+
+        # token_id → bin center (for regression loss GT)
+        self.x_id_to_center = {}
+        for i, tok in enumerate(coord_tok.x_tokens[1:], start=1):
+            tid = llm_tokenizer.convert_tokens_to_ids(tok)
+            self.x_id_to_center[tid] = (i - 0.5) * bin_size
+        self.y_id_to_center = {}
+        for j, tok in enumerate(coord_tok.y_tokens[1:], start=1):
+            tid = llm_tokenizer.convert_tokens_to_ids(tok)
+            self.y_id_to_center[tid] = (j - 0.5) * bin_size
 
         # precompute walkable grids per scene (deduplicate by clip prefix)
         self.walkable_grids = {}
@@ -273,6 +285,7 @@ class PhysicsLoss:
         collision_loss = zero
         smoothness_loss = zero
         walkable_loss = zero
+        regression_loss = zero
         count = 0
 
         B = logits.shape[0]
@@ -339,6 +352,26 @@ class PhysicsLoss:
             soft_y = soft_y[:actual_T * N].reshape(actual_T, N)
             valid_mask = valid[:actual_T * N].reshape(actual_T, N)
 
+            # regression loss: SmoothL1 between soft prediction and GT bin center
+            if self.regression_weight > 0:
+                gt_x = torch.tensor(
+                    [self.x_id_to_center.get(lab[p].item(), 0.0) for p in x_positions[:expected]],
+                    device=self.device, dtype=torch.float32
+                )
+                gt_y = torch.tensor(
+                    [self.y_id_to_center.get(lab[p].item(), 0.0) for p in y_positions[:expected]],
+                    device=self.device, dtype=torch.float32
+                )
+                flat_soft_x = soft_x.reshape(-1)
+                flat_soft_y = soft_y.reshape(-1)
+                flat_valid = valid_mask.reshape(-1)
+                if flat_valid.sum() > 0:
+                    reg_x = torch.nn.functional.smooth_l1_loss(
+                        flat_soft_x[flat_valid], gt_x[flat_valid], beta=self.bin_size)
+                    reg_y = torch.nn.functional.smooth_l1_loss(
+                        flat_soft_y[flat_valid], gt_y[flat_valid], beta=self.bin_size)
+                    regression_loss = regression_loss + self.regression_weight * (reg_x + reg_y)
+
             # smoothness loss: jerk per pedestrian across valid frames
             if self.smoothness_weight > 0 and actual_T > 2:
                 for n in range(N):
@@ -390,11 +423,13 @@ class PhysicsLoss:
             collision_loss = collision_loss / count
             smoothness_loss = smoothness_loss / count
             walkable_loss = walkable_loss / count
+            regression_loss = regression_loss / count
 
         return {
             "collision": collision_loss,
             "smoothness": smoothness_loss,
             "walkable": walkable_loss,
+            "regression": regression_loss,
         }
 
 
@@ -445,7 +480,7 @@ class FLINTTrainer(Trainer):
         self.physics_loss_fn = physics_loss_fn
         self.task_name = task_name
         self.output_base = output_base
-        self._step_losses = {"ce": [], "collision": [], "smoothness": [], "walkable": []}
+        self._step_losses = {"ce": [], "collision": [], "smoothness": [], "walkable": [], "regression": []}
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         sample_indices = inputs.pop("sample_indices", None)
@@ -456,6 +491,7 @@ class FLINTTrainer(Trainer):
         c_loss = torch.tensor(0.0, device=ce_loss.device)
         s_loss = torch.tensor(0.0, device=ce_loss.device)
         w_loss = torch.tensor(0.0, device=ce_loss.device)
+        r_loss = torch.tensor(0.0, device=ce_loss.device)
 
         if self.physics_loss_fn is not None and sample_indices is not None:
             labels = inputs.get("labels")
@@ -464,19 +500,20 @@ class FLINTTrainer(Trainer):
                 c_loss = p["collision"]
                 s_loss = p["smoothness"]
                 w_loss = p["walkable"]
+                r_loss = p["regression"]
 
-        total = ce_loss + c_loss + s_loss + w_loss
+        total = ce_loss + c_loss + s_loss + w_loss + r_loss
 
         self._step_losses["ce"].append(ce_loss.item())
         self._step_losses["collision"].append(c_loss.item())
         self._step_losses["smoothness"].append(s_loss.item())
         self._step_losses["walkable"].append(w_loss.item())
+        self._step_losses["regression"].append(r_loss.item())
 
         step = self.state.global_step
         print(f"[Step {step}] CE: {ce_loss.item():.4f} | "
-              f"Collision: {c_loss.item():.4f} | "
-              f"Smoothness: {s_loss.item():.4f} | "
-              f"Walkable: {w_loss.item():.4f} | "
+              f"Coll: {c_loss.item():.4f} | Smooth: {s_loss.item():.4f} | "
+              f"Walk: {w_loss.item():.4f} | Reg: {r_loss.item():.4f} | "
               f"Total: {total.item():.4f}")
 
         return (total, outputs) if return_outputs else total
@@ -505,6 +542,7 @@ class LossLogCallback(TrainerCallback):
                 f"collision={means['collision']:.6f} "
                 f"smoothness={means['smoothness']:.6f} "
                 f"walkable={means['walkable']:.6f} "
+                f"regression={means['regression']:.6f} "
                 f"total={total:.6f}\n")
         with open(log_path, "a") as f:
             f.write(line)
@@ -723,20 +761,23 @@ def train(args):
         max_seq_length=args.max_seq_length,
     )
 
-    # physics loss
+    # physics loss (enabled whenever any weight > 0 and coord tokens are used)
     physics_loss_fn = None
-    if args.physics != "none" and use_coord and coord_tok is not None:
+    if use_coord and coord_tok is not None:
         physics_config = {
-            "collision_weight": args.collision_weight if args.physics in ("collision", "all") else 0.0,
-            "smoothness_weight": args.smoothness_weight if args.physics == "all" else 0.0,
-            "walkable_weight": args.walkable_weight if args.physics == "all" else 0.0,
+            "collision_weight": args.collision_weight,
+            "smoothness_weight": args.smoothness_weight,
+            "walkable_weight": args.walkable_weight,
+            "regression_weight": args.regression_weight,
             "collision_threshold": args.collision_threshold,
         }
-        physics_loss_fn = PhysicsLoss(
-            coord_tok, llm_tokenizer, train_meta, physics_config, model.device
-        )
-        enabled = [k for k, v in physics_config.items() if "weight" in k and v > 0]
-        print(f"Physics loss enabled: {enabled}")
+        any_active = any(v > 0 for k, v in physics_config.items() if "weight" in k)
+        if any_active:
+            physics_loss_fn = PhysicsLoss(
+                coord_tok, llm_tokenizer, train_meta, physics_config, model.device
+            )
+            enabled = [k for k, v in physics_config.items() if "weight" in k and v > 0]
+            print(f"Physics loss enabled: {enabled}")
 
     # prepare inference peek (generate one sample per epoch for observation)
     infer_fn = None
@@ -804,7 +845,7 @@ def train(args):
     epoch_cb._trainer = trainer
 
     print(f"\nTraining: task={args.task_name}, backbone={backbone}, "
-          f"coord_tokens={use_coord}, physics={args.physics}")
+          f"coord_tokens={use_coord}")
 
     trainer.train()
     print("Training complete.")
@@ -844,12 +885,11 @@ if __name__ == "__main__":
     parser.add_argument("--lr_scheduler", type=str, default="cosine")
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
 
-    # physics loss
-    parser.add_argument("--physics", type=str, default="none",
-                        choices=["none", "collision", "all"])
-    parser.add_argument("--collision_weight", type=float, default=0.001)
-    parser.add_argument("--smoothness_weight", type=float, default=0.05)
-    parser.add_argument("--walkable_weight", type=float, default=0.05)
+    # loss weights (set to 0 to disable)
+    parser.add_argument("--collision_weight", type=float, default=0.0)
+    parser.add_argument("--smoothness_weight", type=float, default=0.0)
+    parser.add_argument("--walkable_weight", type=float, default=0.0)
+    parser.add_argument("--regression_weight", type=float, default=0.0)
     parser.add_argument("--collision_threshold", type=float, default=10.0)
 
     # mid-training observation

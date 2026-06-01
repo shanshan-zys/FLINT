@@ -35,7 +35,7 @@ LLM_OPTS=""
 # ── Run evaluation for each task x epoch ──────────────────────────
 IFS=',' read -ra EP_ARRAY <<< "$EVAL_EPOCHS"
 
-for TASK_BASE in main ablation_no_physics ablation_raw_physics; do
+for TASK_BASE in main ablation_raw ablation_no_physics ablation_no_reg ablation_ce_only; do
     for EP in "${EP_ARRAY[@]}"; do
         TASK="${TASK_BASE}-${TRAIN_SUFFIX}-${EP}"
         RESULT_FILE="${OUTPUT_BASE}/results/${TASK}.json"
