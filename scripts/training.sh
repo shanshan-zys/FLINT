@@ -26,18 +26,12 @@ SMOOTHNESS_W=0.05
 WALKABLE_W=0.05
 COLLISION_THRESH=10.0
 
-# mid-training inference (empty string = disabled)
-INFER_EPOCHS="0,5,10,15,20"
-# INFER_EPOCHS=""
+# mid-training observation (comment out to disable)
+PEEK="--peek_inference"
+# PEEK=""
 
 # ── Task name suffix ──────────────────────────────────────────────
 SUFFIX="ep${EPOCHS}-c${COLLISION_W}-s${SMOOTHNESS_W}-w${WALKABLE_W}"
-
-# ── Inference flag ────────────────────────────────────────────────
-INFER_FLAG=""
-if [ -n "$INFER_EPOCHS" ]; then
-    INFER_FLAG="--infer_epochs $INFER_EPOCHS --max_new_tokens $MAX_NEW"
-fi
 
 # ── 1. Main: coord tokens + full physics loss ─────────────────────
 TASK="main-${SUFFIX}"
@@ -55,7 +49,7 @@ python source/training.py \
     --seed $SEED \
     --collision_weight $COLLISION_W --smoothness_weight $SMOOTHNESS_W \
     --walkable_weight $WALKABLE_W --collision_threshold $COLLISION_THRESH \
-    $INFER_FLAG
+    --max_new_tokens $MAX_NEW $PEEK
 
 # ── 2. Ablation: coord tokens, no physics loss ───────────────────
 TASK="ablation_no_physics-${SUFFIX}"
@@ -71,7 +65,7 @@ python source/training.py \
     --learning_rate $LR --lr_scheduler $SCHED --warmup_ratio $WARMUP \
     --bin_size $BIN --resolution_h $RES_H --resolution_w $RES_W \
     --seed $SEED \
-    $INFER_FLAG
+    --max_new_tokens $MAX_NEW $PEEK
 
 # ── 3. Ablation: raw numbers + full physics loss ─────────────────
 TASK="ablation_raw_physics-${SUFFIX}"
@@ -90,6 +84,6 @@ python source/training.py \
     --seed $SEED \
     --collision_weight $COLLISION_W --smoothness_weight $SMOOTHNESS_W \
     --walkable_weight $WALKABLE_W --collision_threshold $COLLISION_THRESH \
-    $INFER_FLAG
+    --max_new_tokens $MAX_NEW $PEEK
 
 echo "All training runs complete."

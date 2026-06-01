@@ -13,10 +13,27 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 
+from transformers import LogitsProcessor
+
 from dataset_construction import CoordTokenizer, decode_raw_numbers
 
 
 ABSENT = -1.0
+
+
+class CoordConstrainedLogitsProcessor(LogitsProcessor):
+    """Force generation to only pick from coord tokens or EOS."""
+
+    def __init__(self, allowed_ids):
+        self.allowed_mask = None
+        self.allowed_ids = set(allowed_ids)
+
+    def __call__(self, input_ids, scores):
+        if self.allowed_mask is None or self.allowed_mask.shape[-1] != scores.shape[-1]:
+            self.allowed_mask = torch.full_like(scores[0], float("-inf"))
+            for tid in self.allowed_ids:
+                self.allowed_mask[tid] = 0.0
+        return scores + self.allowed_mask.unsqueeze(0)
 
 
 def format_alpaca_prompt(sample: dict) -> str:
@@ -63,9 +80,13 @@ def load_model(backbone, checkpoint_path, use_coord_tokens, resolution, bin_size
     )
 
     coord_tok = None
+    logits_processor = None
     if use_coord_tokens:
         coord_tok = CoordTokenizer(resolution=resolution, bin_size=bin_size)
         model.resize_token_embeddings(len(tokenizer))
+        allowed_ids = tokenizer.convert_tokens_to_ids(coord_tok.vocab)
+        allowed_ids.append(tokenizer.eos_token_id)
+        logits_processor = CoordConstrainedLogitsProcessor(allowed_ids)
 
     model = PeftModel.from_pretrained(model, checkpoint_path)
     model.eval()
@@ -73,7 +94,7 @@ def load_model(backbone, checkpoint_path, use_coord_tokens, resolution, bin_size
     model.generation_config.top_p = None
     model.generation_config.top_k = None
 
-    return model, tokenizer, coord_tok
+    return model, tokenizer, coord_tok, logits_processor
 
 
 def parse_output_trajectory(generated_text, use_coord_tokens, coord_tok, population, frames):
@@ -119,7 +140,7 @@ def compact_json(obj, indent=2):
     return _serialize(obj, 0) + "\n"
 
 
-def run_inference(model, tokenizer, coord_tok, test_samples, args, use_coord, task_name, checkpoint_label):
+def run_inference(model, tokenizer, coord_tok, logits_processor, test_samples, args, use_coord, task_name, checkpoint_label):
     """Run inference on test split, save results."""
     print(f"\nRunning inference: {task_name} (checkpoint: {checkpoint_label})")
 
@@ -147,6 +168,9 @@ def run_inference(model, tokenizer, coord_tok, test_samples, args, use_coord, ta
                 gen_kwargs["top_p"] = args.top_p
             else:
                 gen_kwargs["do_sample"] = False
+
+            if logits_processor is not None:
+                gen_kwargs["logits_processor"] = [logits_processor]
 
             with torch.no_grad():
                 output_ids = model.generate(**inputs, **gen_kwargs)
@@ -237,7 +261,7 @@ def generate(args):
         print(f"  Epoch {ep}: loading {checkpoint_path}")
         print(f"{'='*60}")
 
-        model, tokenizer, coord_tok = load_model(
+        model, tokenizer, coord_tok, logits_processor = load_model(
             args.backbone, checkpoint_path, use_coord, resolution,
             args.bin_size, args.max_seq_length
         )
@@ -245,7 +269,7 @@ def generate(args):
               f"do_sample={'True' if args.num_samples > 1 else 'False'}, "
               f"temperature={args.temperature}, top_p={args.top_p}")
 
-        run_inference(model, tokenizer, coord_tok, test_samples,
+        run_inference(model, tokenizer, coord_tok, logits_processor, test_samples,
                       args, use_coord, task_name, f"epoch_{ep}")
 
         del model

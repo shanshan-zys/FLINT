@@ -6,7 +6,7 @@ Supports:
   --use_raw_prompt                         tokenizer ablation (metadata.raw_prompt)
   --physics none / collision / all         physics loss selection
   --task_name                              names output dirs under loss/ and checkpoint/
-  --infer_epochs 0,5,10,15,20             run inference at specified epochs
+  --peek_inference                        generate one sample per epoch for observation
 """
 
 import os
@@ -18,12 +18,13 @@ import argparse
 import numpy as np
 
 from datasets import Dataset
-from trl import SFTConfig, SFTTrainer
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
     TrainerCallback,
+    Trainer,
+    TrainingArguments,
 )
 from peft import LoraConfig, get_peft_model
 
@@ -436,7 +437,7 @@ class CompletionOnlyCollator:
 # ====================================================================
 # Custom trainer with physics loss + per-step logging
 # ====================================================================
-class FLINTTrainer(SFTTrainer):
+class FLINTTrainer(Trainer):
 
     def __init__(self, *args, physics_loss_fn=None, task_name="default",
                  output_base="./outputs", **kwargs):
@@ -513,6 +514,44 @@ class LossLogCallback(TrainerCallback):
         for k in losses:
             losses[k].clear()
 
+    def peek_prediction(self, trainer, epoch):
+        """Forward first training sample, print argmax next-token prediction."""
+        model = trainer.model
+        model.eval()
+
+        ds = trainer.train_dataset
+        sample = ds[0]
+        input_ids = torch.tensor(sample["input_ids"], dtype=torch.long).unsqueeze(0)
+        input_ids = input_ids.to(model.device)
+        resp_start = sample["response_start"]
+
+        with torch.no_grad():
+            logits = model(input_ids=input_ids).logits[0]  # (seq_len, vocab)
+
+        # argmax at response positions (logits[t] predicts token t+1)
+        pred_ids = logits[resp_start - 1: -1].argmax(dim=-1).tolist()
+        gt_ids = sample["input_ids"][resp_start:]
+
+        tokenizer = getattr(trainer, "processing_class", None) or trainer.tokenizer
+
+        # Show first 30 predicted vs ground truth tokens
+        n_show = min(30, len(pred_ids), len(gt_ids))
+        pred_tokens = tokenizer.convert_ids_to_tokens(pred_ids[:n_show])
+        gt_tokens = tokenizer.convert_ids_to_tokens(gt_ids[:n_show])
+
+        # Count how many coord tokens in full prediction
+        coord_pattern = re.compile(r'<[xy]_\d+>')
+        n_coord_pred = sum(1 for t in tokenizer.convert_ids_to_tokens(pred_ids) if coord_pattern.match(t))
+        n_correct = sum(1 for p, g in zip(pred_ids, gt_ids) if p == g)
+
+        print(f"[Epoch {epoch} peek] response_len={len(gt_ids)}, "
+              f"coord_tokens_in_pred={n_coord_pred}/{len(pred_ids)}, "
+              f"exact_match={n_correct}/{len(gt_ids)} ({100*n_correct/max(len(gt_ids),1):.1f}%)")
+        print(f"  GT  (first {n_show}): {gt_tokens}")
+        print(f"  Pred(first {n_show}): {pred_tokens}")
+
+        model.train()
+
 
 class CheckpointCallback(TrainerCallback):
 
@@ -528,13 +567,16 @@ class CheckpointCallback(TrainerCallback):
         )
         os.makedirs(ckpt_dir, exist_ok=True)
         trainer.model.save_pretrained(ckpt_dir, save_embedding_layers=True)
-        trainer.processing_class.save_pretrained(ckpt_dir)
+        tokenizer = getattr(trainer, "processing_class", None) or trainer.tokenizer
+        tokenizer.save_pretrained(ckpt_dir)
         self._last_saved_epoch = epoch
         print(f"Checkpoint saved: {ckpt_dir}")
 
     def save_if_needed(self, trainer, epoch):
         if epoch % self.save_interval == 0:
             self._save(trainer, epoch)
+            return True
+        return False
 
     def save_final(self, trainer, epoch):
         if self._last_saved_epoch != epoch:
@@ -587,100 +629,45 @@ def compact_json(obj, indent=2):
     return _serialize(obj, 0) + "\n"
 
 
-def run_inference_at_epoch(trainer, tokenizer, coord_tok, test_samples,
-                           use_coord, use_raw_prompt, epoch,
-                           task_name, output_base, max_new_tokens, max_seq_length):
-    """Run inference on test split using the current model state."""
-    print(f"\n{'='*60}")
-    print(f"  Mid-training inference at epoch {epoch}")
-    print(f"{'='*60}")
-
+def peek_generate_one(trainer, tokenizer, coord_tok, sample,
+                      use_coord, use_raw_prompt, epoch, max_new_tokens, max_seq_length):
+    """Generate one sample unconstrained, print result to observe learning progress."""
     model = trainer.model
     was_training = model.training
     model.eval()
-
-    # modules_to_save (embed_tokens, lm_head) may be in float32 while
-    # hidden states are bfloat16, causing dtype mismatch during generate
     model.to(dtype=torch.bfloat16)
 
     model.generation_config.temperature = None
     model.generation_config.top_p = None
     model.generation_config.top_k = None
 
-    results = []
-    for idx, sample in enumerate(test_samples):
-        meta = sample["metadata"]
+    meta = sample["metadata"]
+    if use_raw_prompt:
+        fields = meta["raw_prompt"]
+    else:
+        fields = sample
 
-        if use_raw_prompt:
-            fields = meta["raw_prompt"]
-        else:
-            fields = sample
+    prompt = format_alpaca_prompt(fields)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
+                       max_length=max_seq_length).to(model.device)
 
-        prompt = format_alpaca_prompt(fields)
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
-                           max_length=max_seq_length).to(model.device)
+    with torch.no_grad():
+        output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                    do_sample=False)
 
-        with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                        do_sample=False)
+    new_ids = output_ids[0][inputs.input_ids.shape[1]:]
+    generated_text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
-        new_ids = output_ids[0][inputs.input_ids.shape[1]:]
-
-        think_token = tokenizer.convert_tokens_to_ids("<think>")
-        end_think_token = tokenizer.convert_tokens_to_ids("</think>")
-        if think_token is not None and think_token in new_ids:
-            try:
-                end_pos = new_ids.tolist().index(end_think_token)
-                new_ids = new_ids[end_pos + 1:]
-            except ValueError:
-                pass
-
-        generated_text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-
-        if idx == 0:
-            raw_text = tokenizer.decode(
-                output_ids[0][inputs.input_ids.shape[1]:],
-                skip_special_tokens=False,
-            ).strip()
-            print(f"[DEBUG epoch {epoch}] Raw generated (first 500 chars):\n{raw_text[:500]}")
-            print(f"[DEBUG epoch {epoch}] Cleaned text (first 500 chars):\n{generated_text[:500]}")
-            if use_coord:
-                coord_tokens = re.findall(r'<[xy]_\d+>', generated_text)
-                print(f"[DEBUG epoch {epoch}] Coord tokens found: {len(coord_tokens)}, "
-                      f"expected: {meta['population'] * meta['frames'] * 2}")
-            else:
-                parts = generated_text.strip().split(";")
-                print(f"[DEBUG epoch {epoch}] Raw number parts found: {len(parts)}, "
-                      f"expected: {meta['population'] * meta['frames']}")
-
-        traj = parse_output_trajectory(
-            generated_text, use_coord, coord_tok,
-            meta["population"], meta["frames"]
-        )
-
-        result = {
-            "clip_id": meta["clip_name"],
-            "output_trajectories": [traj],
-            "metadata": {
-                "population": meta["population"],
-                "frames": meta["frames"],
-                "walkable_area": meta["walkable_area"],
-                "scenario_description": meta["scenario_description"],
-                "crowd_description": meta["crowd_description"],
-                "trajectory": meta["trajectory"],
-            }
-        }
-        results.append(result)
-
-        print(f"  [{idx+1}/{len(test_samples)}] {meta['clip_name']} "
-              f"(pop={meta['population']}, frames={meta['frames']})")
-
-    out_dir = os.path.join(output_base, "results")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{task_name}-{epoch}.json")
-    with open(out_path, "w") as f:
-        f.write(compact_json(results))
-    print(f"Inference results saved: {out_path} ({len(results)} samples)")
+    if use_coord:
+        coord_tokens = re.findall(r'<[xy]_\d+>', generated_text)
+        print(f"[Epoch {epoch} generate] clip={meta['clip_name']} | "
+              f"coord_tokens={len(coord_tokens)}, expected={meta['population'] * meta['frames'] * 2}")
+        print(f"  First 60 tokens: {coord_tokens[:60]}")
+    else:
+        parts = generated_text.strip().split(";")
+        print(f"[Epoch {epoch} generate] clip={meta['clip_name']} | "
+              f"parts={len(parts)}, expected={meta['population'] * meta['frames']}")
+        print(f"  First 200 chars: {generated_text[:200]}")
 
     if was_training:
         model.train()
@@ -700,8 +687,9 @@ class EpochEndCallback(TrainerCallback):
         epoch = int(round(state.epoch))
         if hasattr(self, "_trainer"):
             self.loss_cb.log_epoch(self._trainer, epoch)
-            self.ckpt_cb.save_if_needed(self._trainer, epoch)
-            if self.infer_fn is not None:
+            self.loss_cb.peek_prediction(self._trainer, epoch)
+            saved = self.ckpt_cb.save_if_needed(self._trainer, epoch)
+            if saved and self.infer_fn is not None:
                 self.infer_fn(self._trainer, epoch)
 
     def on_train_end(self, _args, state, _control, **_kwargs):
@@ -750,23 +738,18 @@ def train(args):
         enabled = [k for k, v in physics_config.items() if "weight" in k and v > 0]
         print(f"Physics loss enabled: {enabled}")
 
-    # prepare inference callback
+    # prepare inference peek (generate one sample per epoch for observation)
     infer_fn = None
-    infer_epochs = set()
-    if args.infer_epochs:
-        infer_epochs = set(int(x.strip()) for x in args.infer_epochs.split(","))
+    if args.peek_inference:
         test_samples = [raw_data[i] for i in test_idx]
-        print(f"Mid-training inference enabled at epochs: {sorted(infer_epochs)}")
-        print(f"Test samples for inference: {len(test_samples)}")
+        print(f"Peek inference enabled (1 sample per epoch)")
 
         def infer_fn(trainer, epoch):
-            if epoch in infer_epochs:
-                run_inference_at_epoch(
-                    trainer, llm_tokenizer, coord_tok, test_samples,
-                    use_coord, args.use_raw_prompt, epoch,
-                    args.task_name, args.output_base,
-                    args.max_new_tokens, args.max_seq_length,
-                )
+            peek_generate_one(
+                trainer, llm_tokenizer, coord_tok, test_samples[0],
+                use_coord, args.use_raw_prompt, epoch, args.max_new_tokens,
+                args.max_seq_length,
+            )
 
     # callbacks
     loss_cb = LossLogCallback(args.task_name, args.output_base)
@@ -775,7 +758,7 @@ def train(args):
 
     callbacks = [epoch_cb]
 
-    training_args = SFTConfig(
+    training_args = TrainingArguments(
         output_dir=os.path.join(args.output_base, "runs", args.task_name),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -788,16 +771,14 @@ def train(args):
         eval_strategy="no",
         fp16=not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_bf16_supported(),
-        packing=False,
         report_to="tensorboard",
         seed=args.seed,
         remove_unused_columns=False,
-        dataset_text_field=None,
     )
 
     trainer = FLINTTrainer(
         model=model,
-        processing_class=llm_tokenizer,
+        tokenizer=llm_tokenizer,
         train_dataset=train_ds,
         args=training_args,
         callbacks=callbacks,
@@ -821,15 +802,6 @@ def train(args):
 
     # attach trainer ref so callbacks can access it
     epoch_cb._trainer = trainer
-
-    # run epoch-0 inference (before any training) if requested
-    if 0 in infer_epochs:
-        run_inference_at_epoch(
-            trainer, llm_tokenizer, coord_tok, test_samples,
-            use_coord, args.use_raw_prompt, 0,
-            args.task_name, args.output_base,
-            args.max_new_tokens, args.max_seq_length,
-        )
 
     print(f"\nTraining: task={args.task_name}, backbone={backbone}, "
           f"coord_tokens={use_coord}, physics={args.physics}")
@@ -880,9 +852,9 @@ if __name__ == "__main__":
     parser.add_argument("--walkable_weight", type=float, default=0.05)
     parser.add_argument("--collision_threshold", type=float, default=10.0)
 
-    # mid-training inference
-    parser.add_argument("--infer_epochs", type=str, default=None,
-                        help="Comma-separated epochs to run inference, e.g. '0,5,10,15,20'")
+    # mid-training observation
+    parser.add_argument("--peek_inference", action="store_true",
+                        help="Generate one sample per epoch for observation (no file saved)")
 
     args = parser.parse_args()
     train(args)
