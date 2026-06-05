@@ -1,8 +1,9 @@
 """
-Dataset construction: load clip data + coordinate tokenizer + build SFT samples.
+Dataset construction: load clip data + build SFT samples.
 
-Main output uses coordinate tokens <x_i><y_j>; metadata.raw_prompt contains the
-ablation version with plain x,y;x,y;... format (separate instruction + output).
+Output stores trajectory as N×T×2 array; coordinate tokenization is deferred
+to training time. Metadata includes raw-format instruction/input/output for
+the ablation mode.
 """
 
 import os
@@ -39,8 +40,8 @@ class CoordTokenizer:
     def tokenize(self, trajectories: np.ndarray) -> List[str]:
         N, T, _ = trajectories.shape
         tokens = []
-        for t in range(T):
-            for n in range(N):
+        for n in range(N):
+            for t in range(T):
                 x, y = trajectories[n, t]
                 if x == ABSENT or y == ABSENT:
                     tokens.extend(["<x_0>", "<y_0>"])
@@ -52,20 +53,24 @@ class CoordTokenizer:
 
     def detokenize(self, tokens: List[str], num_agents: int, num_steps: int) -> np.ndarray:
         traj = np.full((num_agents, num_steps, 2), ABSENT)
+        x_tokens = [t for t in tokens if t.startswith("<x_")]
+        y_tokens = [t for t in tokens if t.startswith("<y_")]
         idx = 0
-        for t in range(num_steps):
-            for n in range(num_agents):
-                if idx + 1 >= len(tokens):
+        for n in range(num_agents):
+            for t in range(num_steps):
+                if idx >= len(x_tokens) or idx >= len(y_tokens):
                     break
-                x_tok, y_tok = tokens[idx], tokens[idx + 1]
-                idx += 2
                 try:
-                    xi = int(x_tok.strip("<>").split("_")[1])
-                    yj = int(y_tok.strip("<>").split("_")[1])
+                    xi = int(x_tokens[idx].strip("<>").split("_")[1])
+                    yj = int(y_tokens[idx].strip("<>").split("_")[1])
                 except (ValueError, IndexError):
+                    idx += 1
                     continue
+                idx += 1
                 if xi == 0 or yj == 0:
                     continue
+                xi = min(xi, len(self.x_centers) - 1)
+                yj = min(yj, len(self.y_centers) - 1)
                 traj[n, t, 0] = self.x_centers[xi]
                 traj[n, t, 1] = self.y_centers[yj]
         return traj
@@ -74,8 +79,8 @@ class CoordTokenizer:
 def encode_raw_numbers(trajectories: np.ndarray) -> str:
     N, T, _ = trajectories.shape
     parts = []
-    for t in range(T):
-        for n in range(N):
+    for n in range(N):
+        for t in range(T):
             x, y = trajectories[n, t]
             if x == ABSENT or y == ABSENT:
                 parts.append("0,0")
@@ -88,8 +93,8 @@ def decode_raw_numbers(text: str, num_agents: int, num_steps: int) -> np.ndarray
     traj = np.full((num_agents, num_steps, 2), ABSENT)
     parts = text.strip().split(";")
     idx = 0
-    for t in range(num_steps):
-        for n in range(num_agents):
+    for n in range(num_agents):
+        for t in range(num_steps):
             if idx >= len(parts):
                 break
             pair = parts[idx].strip()
@@ -158,12 +163,13 @@ The walkable area is represented as a {grid_w}x{grid_h} (Width x Height) binary 
 
 Not all individuals are present in the first frame. Some may enter the scene from walkable edges at later frames; infer their appearance time and entry position from the crowd dynamics description. Once an individual exits the scene, they are permanently absent and must not reappear in any subsequent frame. The total population, movement duration, motion patterns, and flow directions must be consistent with the provided descriptions.
 
-Generate trajectories as a single unbroken string of coordinate tokens. Output is organized frame by frame: for each frame, output all pedestrians' positions sequentially (Ped 1, Ped 2, ..., Ped N), then proceed to the next frame. Each position is represented as a token pair <x_i><y_j>, where the coordinate origin is at the top-left corner, x increases from left to right (tokens <x_1> to <x_{x_bins}>, bin size {bin_size}), and y increases from top to bottom (tokens <y_1> to <y_{y_bins}>). Use <x_0><y_0> as a placeholder for frames where the individual has not yet appeared or has already left.
+Generate trajectories as a single unbroken string of coordinate tokens. Output is organized pedestrian by pedestrian: for each pedestrian, output all frames' positions sequentially (Frame 1, Frame 2, ..., Frame T), then proceed to the next pedestrian. Each position is represented as a token pair <x_i><y_j>, where the coordinate origin is at the top-left corner, x increases from left to right (tokens <x_1> to <x_{x_bins}>, bin size {bin_size}), and y increases from top to bottom (tokens <y_1> to <y_{y_bins}>). Use <x_0><y_0> as a placeholder for frames where the individual has not yet appeared or has already left.
 
 Example for N=3, T=2 (Ped 3 not yet appeared in frame 1, enters in frame 2):
-Frame 1: Ped1=<x_12><y_34> Ped2=<x_55><y_21> Ped3=<x_0><y_0>
-Frame 2: Ped1=<x_13><y_35> Ped2=<x_54><y_22> Ped3=<x_99><y_88>
-Actual output: <x_12><y_34><x_55><y_21><x_0><y_0><x_13><y_35><x_54><y_22><x_99><y_88>
+Ped1: Frame1=<x_12><y_34> Frame2=<x_13><y_35>
+Ped2: Frame1=<x_55><y_21> Frame2=<x_54><y_22>
+Ped3: Frame1=<x_0><y_0> Frame2=<x_99><y_88>
+Actual output: <x_12><y_34><x_13><y_35><x_55><y_21><x_54><y_22><x_0><y_0><x_99><y_88>
 
 Do not add any explanations, spaces, newlines, or text outside the token string."""
 
@@ -173,12 +179,13 @@ The walkable area is represented as a {grid_w}x{grid_h} (Width x Height) binary 
 
 Not all individuals are present in the first frame. Some may enter the scene from walkable edges at later frames; infer their appearance time and entry position from the crowd dynamics description. Once an individual exits the scene, they are permanently absent and must not reappear in any subsequent frame. The total population, movement duration, motion patterns, and flow directions must be consistent with the provided descriptions.
 
-Generate trajectories as semicolon-separated coordinate pairs. Output is organized frame by frame: for each frame, output all pedestrians' positions sequentially (Ped 1, Ped 2, ..., Ped N), then proceed to the next frame. Each position is an x,y pair in pixel coordinates, where the coordinate origin is at the top-left corner, x increases from left to right (0 to {W}), and y increases from top to bottom (0 to {H}). Use 0,0 as a placeholder for frames where the individual has not yet appeared or has already left.
+Generate trajectories as semicolon-separated coordinate pairs. Output is organized pedestrian by pedestrian: for each pedestrian, output all frames' positions sequentially (Frame 1, Frame 2, ..., Frame T), then proceed to the next pedestrian. Each position is an x,y pair in pixel coordinates, where the coordinate origin is at the top-left corner, x increases from left to right (0 to {W}), and y increases from top to bottom (0 to {H}). Use 0,0 as a placeholder for frames where the individual has not yet appeared or has already left.
 
 Example for N=3, T=2 (Ped 3 not yet appeared in frame 1, enters in frame 2):
-Frame 1: Ped1=58,170 Ped2=274,105 Ped3=0,0
-Frame 2: Ped1=63,173 Ped2=268,108 Ped3=495,440
-Actual output: 58,170;274,105;0,0;63,173;268,108;495,440
+Ped1: Frame1=58,170 Frame2=63,173
+Ped2: Frame1=274,105 Frame2=268,108
+Ped3: Frame1=0,0 Frame2=495,440
+Actual output: 58,170;63,173;274,105;268,108;0,0;495,440
 
 Do not add any explanations, spaces, newlines, or text outside the coordinate string."""
 
@@ -327,15 +334,12 @@ def build_sft_dataset(data_dir: str, output_path: str,
                 initial_states=initial_states_text,
             )
 
-            tokens = tokenizer.tokenize(traj_array)
-            output_text = "".join(tokens)
-
             raw_output = encode_raw_numbers(traj_array)
 
             sft_data.append({
                 "instruction": instruction_coord,
                 "input": sft_input,
-                "output": output_text,
+                "output": traj_array.tolist(),
                 "metadata": {
                     "clip_name": clip_id,
                     "population": num_peds,
@@ -343,12 +347,9 @@ def build_sft_dataset(data_dir: str, output_path: str,
                     "walkable_area": map_full.tolist(),
                     "scenario_description": scenario_desc,
                     "crowd_description": crowd_desc,
-                    "trajectory": traj_array.tolist(),
-                    "raw_prompt": {
-                        "instruction": instruction_raw,
-                        "input": sft_input,
-                        "output": raw_output,
-                    },
+                    "instruction": instruction_raw,
+                    "input": sft_input,
+                    "output": raw_output,
                 },
             })
             clip_count += 1

@@ -3,7 +3,6 @@ FLINT training: LoRA SFT with physics-aware loss.
 
 Supports:
   --use_coord_tokens / --no_coord_tokens   tokenizer mode
-  --use_raw_prompt                         tokenizer ablation (metadata.raw_prompt)
   --physics none / collision / all         physics loss selection
   --task_name                              names output dirs under loss/ and checkpoint/
   --peek_inference                        generate one sample per epoch for observation
@@ -28,7 +27,7 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 
-from dataset_construction import CoordTokenizer, decode_raw_numbers
+from dataset_construction import CoordTokenizer, encode_raw_numbers, decode_raw_numbers
 
 
 ABSENT = -1.0
@@ -70,7 +69,7 @@ def format_alpaca_prompt(sample: dict) -> str:
 # to ensure coord tokens are single tokens (not BPE-split)
 # ====================================================================
 def load_and_split(data_path, tokenizer, coord_tok, seed=42,
-                   use_raw_prompt=False, use_coord_tokens=True, max_seq_length=8192):
+                   use_coord_tokens=True, max_seq_length=8192):
     with open(data_path) as f:
         raw = json.load(f)
 
@@ -83,30 +82,28 @@ def load_and_split(data_path, tokenizer, coord_tok, seed=42,
         all_input_ids, all_response_starts, sample_indices, metadata_list = [], [], [], []
         for new_i, orig_i in enumerate(idx_list):
             s = raw[orig_i]
-            if use_raw_prompt:
-                fields = s["metadata"]["raw_prompt"]
-            else:
-                fields = s
+            meta = s["metadata"]
 
-            # Tokenize prompt (instruction + input + "### Response:\n")
-            prompt_text = format_alpaca_prompt(fields)
+            if use_coord_tokens:
+                instruction = s["instruction"]
+                input_text = s["input"]
+                traj_array = np.array(s["output"])
+                coord_token_list = coord_tok.tokenize(traj_array)
+                response_ids = tokenizer.convert_tokens_to_ids(coord_token_list)
+            else:
+                instruction = meta["instruction"]
+                input_text = meta["input"]
+                raw_output = meta["output"]
+                response_ids = tokenizer.encode(raw_output, add_special_tokens=False)
+
+            prompt_text = format_alpaca_prompt(
+                {"instruction": instruction, "input": input_text}
+            )
             prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
 
-            # Tokenize response: coord tokens via convert_tokens_to_ids (not BPE)
-            if use_coord_tokens:
-                output_text = fields["output"]
-                output_tokens = re.findall(r'<[xy]_\d+>', output_text)
-                response_ids = tokenizer.convert_tokens_to_ids(output_tokens)
-            else:
-                # raw mode: normal tokenization is fine for plain numbers
-                response_ids = tokenizer.encode(fields["output"], add_special_tokens=False)
-
             response_start = len(prompt_ids)
-
-            # Combine: prompt + response + EOS
             input_ids = prompt_ids + response_ids + [tokenizer.eos_token_id]
 
-            # Truncate if needed
             if len(input_ids) > max_seq_length:
                 input_ids = input_ids[:max_seq_length]
 
@@ -114,13 +111,12 @@ def load_and_split(data_path, tokenizer, coord_tok, seed=42,
             all_response_starts.append(response_start)
             sample_indices.append(new_i)
 
-            meta = s["metadata"]
             metadata_list.append({
                 "clip_name": meta["clip_name"],
                 "population": meta["population"],
                 "frames": meta["frames"],
                 "walkable_area": meta["walkable_area"],
-                "trajectory": meta["trajectory"],
+                "trajectory": s["output"],
             })
 
         ds = Dataset.from_dict({
@@ -134,7 +130,6 @@ def load_and_split(data_path, tokenizer, coord_tok, seed=42,
     eval_ds, eval_meta = build(eval_idx)
     print(f"Data split (seed={seed}): train={len(train_ds)}, eval={len(eval_ds)}")
 
-    # Print debug info for first sample
     first_ids = train_ds[0]["input_ids"]
     print(f"[DEBUG] First train sample: {len(first_ids)} tokens")
     if use_coord_tokens and coord_tok:
@@ -343,14 +338,14 @@ class PhysicsLoss:
             y_labels = lab[y_positions]
             valid = (x_labels != self.x0_id) & (y_labels != self.y0_id)  # (expected,)
 
-            # try to reshape to (T, N)
+            # try to reshape to (N, T) — data is agent-first
             actual_T = expected // N if N > 0 else 0
             if actual_T == 0 or actual_T * N != expected:
                 continue
 
-            soft_x = soft_x[:actual_T * N].reshape(actual_T, N)
-            soft_y = soft_y[:actual_T * N].reshape(actual_T, N)
-            valid_mask = valid[:actual_T * N].reshape(actual_T, N)
+            soft_x = soft_x[:actual_T * N].reshape(N, actual_T)
+            soft_y = soft_y[:actual_T * N].reshape(N, actual_T)
+            valid_mask = valid[:actual_T * N].reshape(N, actual_T)
 
             # regression loss: SmoothL1 between soft prediction and GT bin center
             if self.regression_weight > 0:
@@ -375,12 +370,12 @@ class PhysicsLoss:
             # smoothness loss: jerk per pedestrian across valid frames
             if self.smoothness_weight > 0 and actual_T > 2:
                 for n in range(N):
-                    vm = valid_mask[:, n]
+                    vm = valid_mask[n]
                     valid_idx = torch.where(vm)[0]
                     if len(valid_idx) < 3:
                         continue
-                    sx = soft_x[valid_idx, n]
-                    sy = soft_y[valid_idx, n]
+                    sx = soft_x[n, valid_idx]
+                    sy = soft_y[n, valid_idx]
                     vx = sx[1:] - sx[:-1]
                     vy = sy[1:] - sy[:-1]
                     ax = vx[1:] - vx[:-1]
@@ -391,12 +386,12 @@ class PhysicsLoss:
             # collision loss: pairwise distance at each frame
             if self.collision_weight > 0 and N > 1:
                 for t in range(actual_T):
-                    vm = valid_mask[t]
+                    vm = valid_mask[:, t]
                     valid_peds = torch.where(vm)[0]
                     if len(valid_peds) < 2:
                         continue
-                    px = soft_x[t, valid_peds]
-                    py = soft_y[t, valid_peds]
+                    px = soft_x[valid_peds, t]
+                    py = soft_y[valid_peds, t]
                     dx = px.unsqueeze(0) - px.unsqueeze(1)
                     dy = py.unsqueeze(0) - py.unsqueeze(1)
                     dists = torch.sqrt(dx ** 2 + dy ** 2 + 1e-6)
@@ -553,7 +548,7 @@ class LossLogCallback(TrainerCallback):
             losses[k].clear()
 
     def peek_prediction(self, trainer, epoch):
-        """Forward first training sample, print argmax next-token prediction."""
+        """Forward first training sample, print full argmax prediction vs GT."""
         model = trainer.model
         model.eval()
 
@@ -564,29 +559,35 @@ class LossLogCallback(TrainerCallback):
         resp_start = sample["response_start"]
 
         with torch.no_grad():
-            logits = model(input_ids=input_ids).logits[0]  # (seq_len, vocab)
+            logits = model(input_ids=input_ids).logits[0]
 
-        # argmax at response positions (logits[t] predicts token t+1)
         pred_ids = logits[resp_start - 1: -1].argmax(dim=-1).tolist()
         gt_ids = sample["input_ids"][resp_start:]
 
         tokenizer = getattr(trainer, "processing_class", None) or trainer.tokenizer
 
-        # Show first 30 predicted vs ground truth tokens
-        n_show = min(30, len(pred_ids), len(gt_ids))
-        pred_tokens = tokenizer.convert_ids_to_tokens(pred_ids[:n_show])
-        gt_tokens = tokenizer.convert_ids_to_tokens(gt_ids[:n_show])
+        pred_tokens = tokenizer.convert_ids_to_tokens(pred_ids)
+        gt_tokens = tokenizer.convert_ids_to_tokens(gt_ids)
 
-        # Count how many coord tokens in full prediction
-        coord_pattern = re.compile(r'<[xy]_\d+>')
-        n_coord_pred = sum(1 for t in tokenizer.convert_ids_to_tokens(pred_ids) if coord_pattern.match(t))
+        pred_text = tokenizer.decode(pred_ids, skip_special_tokens=True)
+        gt_text = tokenizer.decode(gt_ids, skip_special_tokens=True)
+
+        prompt_text = tokenizer.decode(sample["input_ids"][:resp_start], skip_special_tokens=True)
+
         n_correct = sum(1 for p, g in zip(pred_ids, gt_ids) if p == g)
+        coord_pattern = re.compile(r'<[xy]_\d+>')
+        n_coord_pred = sum(1 for t in pred_tokens if coord_pattern.match(t))
 
+        print(f"\n{'='*60}")
         print(f"[Epoch {epoch} peek] response_len={len(gt_ids)}, "
-              f"coord_tokens_in_pred={n_coord_pred}/{len(pred_ids)}, "
               f"exact_match={n_correct}/{len(gt_ids)} ({100*n_correct/max(len(gt_ids),1):.1f}%)")
-        print(f"  GT  (first {n_show}): {gt_tokens}")
-        print(f"  Pred(first {n_show}): {pred_tokens}")
+        print(f"--- PROMPT ---")
+        print(prompt_text)
+        print(f"--- GT OUTPUT (full, {len(gt_ids)} tokens) ---")
+        print(gt_text)
+        print(f"--- PRED OUTPUT (full, {len(pred_ids)} tokens, coord={n_coord_pred}) ---")
+        print(pred_text)
+        print(f"{'='*60}\n")
 
         model.train()
 
@@ -644,7 +645,7 @@ def parse_output_trajectory(generated_text, use_coord_tokens, coord_tok, populat
     return result
 
 
-COMPACT_KEYS = {"output_trajectories", "walkable_area", "trajectory"}
+COMPACT_KEYS = {"output_trajectories", "walkable_area", "trajectory", "output"}
 
 
 def compact_json(obj, indent=2):
@@ -668,8 +669,8 @@ def compact_json(obj, indent=2):
 
 
 def peek_generate_one(trainer, tokenizer, coord_tok, sample,
-                      use_coord, use_raw_prompt, epoch, max_new_tokens, max_seq_length):
-    """Generate one sample unconstrained, print result to observe learning progress."""
+                      use_coord, epoch, max_new_tokens, max_seq_length):
+    """Generate one sample unconstrained, print full result."""
     model = trainer.model
     was_training = model.training
     model.eval()
@@ -679,10 +680,10 @@ def peek_generate_one(trainer, tokenizer, coord_tok, sample,
     model.generation_config.top_k = None
 
     meta = sample["metadata"]
-    if use_raw_prompt:
-        fields = meta["raw_prompt"]
+    if use_coord:
+        fields = {"instruction": sample["instruction"], "input": sample["input"]}
     else:
-        fields = sample
+        fields = {"instruction": meta["instruction"], "input": meta["input"]}
 
     prompt = format_alpaca_prompt(fields)
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
@@ -696,15 +697,31 @@ def peek_generate_one(trainer, tokenizer, coord_tok, sample,
     generated_text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
     if use_coord:
-        coord_tokens = re.findall(r'<[xy]_\d+>', generated_text)
+        gt_traj = np.array(sample["output"])
+        gt_tokens = coord_tok.tokenize(gt_traj)
+        gt_text = "".join(gt_tokens)
+        pred_tokens = re.findall(r'<[xy]_\d+>', generated_text)
+        expected = meta["population"] * meta["frames"] * 2
+        print(f"\n{'='*60}")
         print(f"[Epoch {epoch} generate] clip={meta['clip_name']} | "
-              f"coord_tokens={len(coord_tokens)}, expected={meta['population'] * meta['frames'] * 2}")
-        print(f"  First 60 tokens: {coord_tokens[:60]}")
+              f"coord_tokens={len(pred_tokens)}, expected={expected}")
+        print(f"--- GT OUTPUT (full) ---")
+        print(gt_text)
+        print(f"--- PRED OUTPUT (full) ---")
+        print(generated_text)
+        print(f"{'='*60}\n")
     else:
+        gt_text = meta["output"]
+        expected = meta["population"] * meta["frames"]
         parts = generated_text.strip().split(";")
+        print(f"\n{'='*60}")
         print(f"[Epoch {epoch} generate] clip={meta['clip_name']} | "
-              f"parts={len(parts)}, expected={meta['population'] * meta['frames']}")
-        print(f"  First 200 chars: {generated_text[:200]}")
+              f"parts={len(parts)}, expected={expected}")
+        print(f"--- GT OUTPUT (full) ---")
+        print(gt_text)
+        print(f"--- PRED OUTPUT (full) ---")
+        print(generated_text)
+        print(f"{'='*60}\n")
 
     if was_training:
         model.train()
@@ -756,7 +773,7 @@ def train(args):
     # load data (pre-tokenized with coord tokens handled correctly)
     train_ds, _, train_meta, _, raw_data, test_idx = load_and_split(
         args.data, llm_tokenizer, coord_tok, seed=args.seed,
-        use_raw_prompt=args.use_raw_prompt, use_coord_tokens=use_coord,
+        use_coord_tokens=use_coord,
         max_seq_length=args.max_seq_length,
     )
 
@@ -787,7 +804,7 @@ def train(args):
         def infer_fn(trainer, epoch):
             peek_generate_one(
                 trainer, llm_tokenizer, coord_tok, test_samples[0],
-                use_coord, args.use_raw_prompt, epoch, args.max_new_tokens,
+                use_coord, epoch, args.max_new_tokens,
                 args.max_seq_length,
             )
 
@@ -857,8 +874,6 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=str, required=True,
                         help="Path to eth-ucy-text.json")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use_raw_prompt", action="store_true",
-                        help="Use metadata.raw_prompt for tokenizer ablation")
 
     # task naming and output
     parser.add_argument("--task_name", type=str, required=True)

@@ -35,7 +35,7 @@ def load_results(output_base, task_name):
     for item in raw:
         population = item["metadata"]["population"]
         frames = item["metadata"]["frames"]
-        gt = np.array(item["metadata"]["trajectory"], dtype=np.float64)
+        gt = np.array(item["metadata"]["output"], dtype=np.float64)
         preds = []
         for traj_list in item["output_trajectories"]:
             preds.append(np.array(traj_list, dtype=np.float64))
@@ -55,22 +55,50 @@ def load_results(output_base, task_name):
 # ====================================================================
 # JADE / JFDE (KD-tree nearest-neighbor)
 # ====================================================================
-def compute_jade(pred, gt):
+def compute_jade(pred, gt, tolerant=True, gap_tolerance=3):
+    """
+    tolerant=True: 按ID对应收集pred点，缺失时向前填充（gap<=gap_tolerance），
+                   pred_pts数量=当前帧gt有效人数（与reference一致）。
+    tolerant=False: 严格模式，缺失直接用penalty，pred_pts包含所有人。
+    """
     N, T, _ = gt.shape
     total_dist, total_count = 0.0, 0
     for t in range(T):
         gt_pts = []
-        for n in range(N):
-            if gt[n, t, 0] != ABSENT and gt[n, t, 1] != ABSENT:
+        pred_pts = []
+        if tolerant:
+            for n in range(N):
+                if gt[n, t, 0] == ABSENT or gt[n, t, 1] == ABSENT:
+                    continue
                 gt_pts.append(gt[n, t])
+                if n < pred.shape[0] and pred[n, t, 0] != ABSENT and pred[n, t, 1] != ABSENT:
+                    pred_pts.append(pred[n, t])
+                else:
+                    filled = False
+                    if n < pred.shape[0]:
+                        for prev_t in range(t - 1, max(t - gap_tolerance - 1, -1), -1):
+                            if pred[n, prev_t, 0] != ABSENT and pred[n, prev_t, 1] != ABSENT:
+                                gt_gap = sum(1 for tt in range(prev_t + 1, t)
+                                             if gt[n, tt, 0] != ABSENT)
+                                if gt_gap <= gap_tolerance:
+                                    pred_pts.append(pred[n, prev_t])
+                                    filled = True
+                                    break
+                    if not filled:
+                        pred_pts.append(PENALTY_POS)
+        else:
+            for n in range(N):
+                if gt[n, t, 0] != ABSENT and gt[n, t, 1] != ABSENT:
+                    gt_pts.append(gt[n, t])
+            if not gt_pts:
+                continue
+            for n in range(pred.shape[0]):
+                if pred[n, t, 0] == ABSENT or pred[n, t, 1] == ABSENT:
+                    pred_pts.append(PENALTY_POS)
+                else:
+                    pred_pts.append(pred[n, t])
         if not gt_pts:
             continue
-        pred_pts = []
-        for n in range(pred.shape[0]):
-            if pred[n, t, 0] == ABSENT or pred[n, t, 1] == ABSENT:
-                pred_pts.append(PENALTY_POS)
-            else:
-                pred_pts.append(pred[n, t])
         gt_arr = np.array(gt_pts)
         pred_arr = np.array(pred_pts)
         if len(pred_arr) == 0:
@@ -84,21 +112,46 @@ def compute_jade(pred, gt):
     return total_dist / max(total_count, 1)
 
 
-def compute_jfde(pred, gt):
+def compute_jfde(pred, gt, tolerant=True, gap_tolerance=3):
+    """
+    tolerant=True: 按ID对应，缺失时向前填充（与reference一致）。
+    tolerant=False: 严格模式，缺失直接用penalty。
+    """
     N, T, _ = gt.shape
     last_frame = T - 1
     gt_pts = []
-    for n in range(N):
-        if gt[n, last_frame, 0] != ABSENT and gt[n, last_frame, 1] != ABSENT:
+    pred_pts = []
+    if tolerant:
+        for n in range(N):
+            if gt[n, last_frame, 0] == ABSENT or gt[n, last_frame, 1] == ABSENT:
+                continue
             gt_pts.append(gt[n, last_frame])
+            if n < pred.shape[0] and pred[n, last_frame, 0] != ABSENT and pred[n, last_frame, 1] != ABSENT:
+                pred_pts.append(pred[n, last_frame])
+            else:
+                filled = False
+                if n < pred.shape[0]:
+                    for prev_t in range(last_frame - 1, max(last_frame - gap_tolerance - 1, -1), -1):
+                        if pred[n, prev_t, 0] != ABSENT and pred[n, prev_t, 1] != ABSENT:
+                            gt_gap = sum(1 for tt in range(prev_t + 1, last_frame)
+                                         if gt[n, tt, 0] != ABSENT)
+                            if gt_gap <= gap_tolerance:
+                                pred_pts.append(pred[n, prev_t])
+                                filled = True
+                                break
+                if not filled:
+                    pred_pts.append(PENALTY_POS)
+    else:
+        for n in range(N):
+            if gt[n, last_frame, 0] != ABSENT and gt[n, last_frame, 1] != ABSENT:
+                gt_pts.append(gt[n, last_frame])
+        for n in range(pred.shape[0]):
+            if pred[n, last_frame, 0] == ABSENT or pred[n, last_frame, 1] == ABSENT:
+                pred_pts.append(PENALTY_POS)
+            else:
+                pred_pts.append(pred[n, last_frame])
     if not gt_pts:
         return 0.0
-    pred_pts = []
-    for n in range(pred.shape[0]):
-        if pred[n, last_frame, 0] == ABSENT or pred[n, last_frame, 1] == ABSENT:
-            pred_pts.append(PENALTY_POS)
-        else:
-            pred_pts.append(pred[n, last_frame])
     gt_arr = np.array(gt_pts)
     pred_arr = np.array(pred_pts)
     if len(pred_arr) == 0:
@@ -144,10 +197,10 @@ def trajectory_smoothness(traj):
     return float(np.mean(all_jerk)) if all_jerk else 0.0
 
 
-def compute_metrics(pred, gt):
+def compute_metrics(pred, gt, tolerant=True):
     return {
-        "JADE": compute_jade(pred, gt),
-        "JFDE": compute_jfde(pred, gt),
+        "JADE": compute_jade(pred, gt, tolerant=tolerant),
+        "JFDE": compute_jfde(pred, gt, tolerant=tolerant),
         "Collision_Rate": collision_rate(pred),
         "Smoothness": trajectory_smoothness(pred),
     }
@@ -297,40 +350,55 @@ def visualize_video(sample, data_dir, output_dir, use_background=False):
 
 
 # ====================================================================
-# Image visualization
+# Image visualization (side-by-side: GT left, Pred right)
 # ====================================================================
-def visualize_image(sample, data_dir, output_dir):
+def _draw_trajectories(img, traj, N, T, colors, label=None):
     import cv2
-    clip_id = sample["clip_id"]
-    subset = _extract_subset(clip_id)
-    pred = sample["preds"][0]
-    N, T, _ = pred.shape
-
-    bg_path = os.path.join(data_dir, subset, f"{subset}.png")
-    img = cv2.imread(bg_path)
-    if img is None:
-        print(f"  Warning: background not found: {bg_path}, skipping")
-        return
-    img = cv2.resize(img, (640, 480))
-
-    rng = np.random.default_rng(42)
-    colors = {n: tuple(map(int, rng.integers(50, 255, 3))) for n in range(N)}
-
     for n in range(N):
         pts = []
         for t in range(T):
-            if pred[n, t, 0] != ABSENT:
-                pts.append((int(round(pred[n, t, 0])), int(round(pred[n, t, 1]))))
+            if traj[n, t, 0] != ABSENT:
+                pts.append((int(round(traj[n, t, 0])), int(round(traj[n, t, 1]))))
         if len(pts) >= 2:
             pts_arr = np.array(pts, dtype=np.int32)
             cv2.polylines(img, [pts_arr], False, colors[n], 2, cv2.LINE_AA)
         if pts:
             cv2.circle(img, pts[0], 5, colors[n], -1)
             cv2.circle(img, pts[-1], 5, colors[n], 2)
+    if label:
+        cv2.putText(img, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def visualize_image(sample, data_dir, output_dir):
+    import cv2
+    clip_id = sample["clip_id"]
+    subset = _extract_subset(clip_id)
+    pred = sample["preds"][0]
+    gt = sample["gt"]
+    N, T, _ = pred.shape
+
+    bg_path = os.path.join(data_dir, subset, f"{subset}.png")
+    bg = cv2.imread(bg_path)
+    if bg is None:
+        print(f"  Warning: background not found: {bg_path}, skipping")
+        return
+    bg = cv2.resize(bg, (640, 480))
+
+    rng = np.random.default_rng(42)
+    colors = {n: tuple(map(int, rng.integers(50, 255, 3))) for n in range(N)}
+
+    img_gt = bg.copy()
+    img_pred = bg.copy()
+    _draw_trajectories(img_gt, gt, N, T, colors, "GT")
+    _draw_trajectories(img_pred, pred, N, T, colors, "Pred")
+
+    gap = np.full((480, 10, 3), 40, dtype=np.uint8)
+    canvas = np.hstack([img_gt, gap, img_pred])
 
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"{clip_id}.png")
-    cv2.imwrite(out_path, img)
+    cv2.imwrite(out_path, canvas)
 
 
 # ====================================================================
@@ -631,6 +699,10 @@ def main():
 
     parser.add_argument("--use_background", action="store_true")
     parser.add_argument("--collision_radius", type=float, default=3.0)
+    parser.add_argument("--tolerant", action="store_true", default=True,
+                        help="Tolerant JADE/JFDE: ID-matched with gap filling (default)")
+    parser.add_argument("--no_tolerant", action="store_true",
+                        help="Strict JADE/JFDE: no gap filling, all preds in pool")
 
     parser.add_argument("--llm_provider", type=str, default="deepseek",
                         choices=["deepseek", "openai", "google"])
@@ -640,6 +712,8 @@ def main():
 
     args = parser.parse_args()
 
+    tolerant = not args.no_tolerant
+
     samples = load_results(args.output_base, args.task_name)
     K = len(samples[0]["preds"])
     task_dir = os.path.join(args.output_base, "results", args.task_name)
@@ -647,6 +721,7 @@ def main():
 
     print(f"Task: {args.task_name}")
     print(f"Clips: {len(samples)}, Samples/clip: {K}")
+    print(f"JADE/JFDE mode: {'tolerant' if tolerant else 'strict'}")
 
     # ── Metrics ───────────────────────────────────────────────────
     if args.metrics:
@@ -655,7 +730,7 @@ def main():
         for sample in samples:
             clip_metrics_list = []
             for pred in sample["preds"]:
-                clip_metrics_list.append(compute_metrics(pred, sample["gt"]))
+                clip_metrics_list.append(compute_metrics(pred, sample["gt"], tolerant=tolerant))
             avg = {}
             for key in clip_metrics_list[0]:
                 avg[key] = float(np.mean([m[key] for m in clip_metrics_list]))
